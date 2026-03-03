@@ -1,0 +1,99 @@
+version: '3.8'
+
+services:
+  # ===== Database =====
+  mongodb:
+    image: mongo:7
+    container_name: hackathon-mongodb
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: admin123
+      MONGO_INITDB_DATABASE: delivery_bot
+    volumes:
+      - mongodb_data:/data/db
+      - ./mongo-init.js:/docker-entrypoint-initdb.d/mongo-init.js:ro
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - app-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: hackathon-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    networks:
+      - app-network
+
+  # ===== Backend (Node.js API + Socket.IO) =====
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: hackathon-backend
+    restart: unless-stopped
+    privileged: true
+    ports:
+      - "5000:5000"
+      - "8765:8765"
+    devices:
+      - /dev/gpiochip0:/dev/gpiochip0
+      - /dev/gpiochip4:/dev/gpiochip4
+    volumes:
+      - /dev:/dev
+      - /run/udev:/run/udev:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      PORT: 5000
+      MONGODB_URI: mongodb://admin:admin123@mongodb:27017/delivery_bot?authSource=admin
+      REDIS_URL: redis://redis:6379
+      NODE_ENV: production
+      ENABLE_HARDWARE: "true"
+      CAMERA_HOST: host.docker.internal
+      CAMERA_PORT: "8554"
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - app-network
+
+  # ===== Frontend (React + Nginx) =====
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # Qua nginx proxy, frontend gọi cùng origin
+        REACT_APP_API_URL: /api
+        REACT_APP_SOCKET_URL: /
+    container_name: hackathon-frontend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge
+
+volumes:
+  mongodb_data:

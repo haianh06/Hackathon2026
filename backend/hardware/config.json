@@ -1,0 +1,15 @@
+{
+    "motor": {
+        "driver_type": "lgpio",
+        "type": "dual_servo",
+        "left_pin": 12,
+        "right_pin": 13,
+        "drive_speed": 300,
+        "turn_speed": 200
+    },
+    "camera": {
+        "width": 640,
+        "height": 480,
+        "fps": 15
+    }
+}
