@@ -46,6 +46,7 @@ export const getMyOrders = () => api.get('/orders/my');
 export const getPendingOrders = () => api.get('/orders/pending');
 export const confirmOrder = (id) => api.put(`/orders/${id}/confirm`);
 export const markDelivered = (id) => api.put(`/orders/${id}/delivered`);
+export const customerConfirmOrder = (id) => api.put(`/orders/${id}/customer-confirm`);
 export const cancelOrder = (id) => api.put(`/orders/${id}/cancel`);
 
 // Map
@@ -68,5 +69,12 @@ export const stopHardwareDaemon = () => api.post('/hardware/daemon/stop');
 // Delivery Logs
 export const getDeliveryLogs = (params) => api.get('/delivery-logs', { params });
 export const getDeliveryStats = () => api.get('/delivery-logs/stats');
+export const getDeliveryLogByOrder = (orderId) => api.get(`/delivery-logs/order/${orderId}`);
+
+// Notifications
+export const getNotifications = (params) => api.get('/notifications', { params });
+export const getUnreadNotificationCount = () => api.get('/notifications/unread-count');
+export const markNotificationRead = (id) => api.put(`/notifications/${id}/read`);
+export const markAllNotificationsRead = () => api.put('/notifications/read-all');
 
 export default api;

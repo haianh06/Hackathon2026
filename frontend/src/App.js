@@ -7,11 +7,11 @@ import CustomerOrderPage from './pages/CustomerOrderPage';
 import MyOrdersPage from './pages/MyOrdersPage';
 import StaffOrdersPage from './pages/StaffOrdersPage';
 import StaffControlPage from './pages/StaffControlPage';
-import StaffCameraPage from './pages/StaffCameraPage';
+// StaffCameraPage merged into StaffControlPage
 import AdminDashboard from './pages/AdminDashboard';
 import AdminLogsPage from './pages/AdminLogsPage';
+import MapBuilderPage from './pages/MapBuilderPage';
 import MapPage from './pages/MapPage';
-import DevPage from './pages/DevPage';
 
 function ProtectedRoute({ children, roles }) {
     const { user, loading } = useAuth();
@@ -35,13 +35,14 @@ function AppRoutes() {
                 {/* Staff */}
                 <Route path="/staff/orders" element={<ProtectedRoute roles={['staff', 'admin']}><StaffOrdersPage /></ProtectedRoute>} />
                 <Route path="/staff/control" element={<ProtectedRoute roles={['staff', 'admin']}><StaffControlPage /></ProtectedRoute>} />
-                <Route path="/staff/camera" element={<ProtectedRoute roles={['staff', 'admin']}><StaffCameraPage /></ProtectedRoute>} />
                 {/* Admin */}
                 <Route path="/admin" element={<ProtectedRoute roles={['admin']}><AdminDashboard /></ProtectedRoute>} />
                 <Route path="/admin/logs" element={<ProtectedRoute roles={['admin']}><AdminLogsPage /></ProtectedRoute>} />
-                {/* Dev */}
-                <Route path="/map" element={<ProtectedRoute roles={['staff', 'admin']}><MapPage /></ProtectedRoute>} />
-                <Route path="/dev" element={<ProtectedRoute roles={['staff', 'admin']}><DevPage /></ProtectedRoute>} />
+                {/* Map Builder: separate page */}
+                <Route path="/admin/map-builder" element={<ProtectedRoute roles={['admin']}><MapBuilderPage /></ProtectedRoute>} />
+                {/* Map + Dev Debug: combined page */}
+                <Route path="/map" element={<ProtectedRoute roles={['admin']}><MapPage /></ProtectedRoute>} />
+                <Route path="/dev" element={<Navigate to="/map" replace />} />
             </Route>
             <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>

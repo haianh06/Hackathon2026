@@ -141,6 +141,7 @@ class LineFollower:
       - Morphological cleanup of the binary mask
       - Tracks expected lane width from 2-border rows to infer missing borders
       - Confidence-weighted averaging (2-border rows weigh more)
+      - Optional Canny-edge-detection fusion for improved lane tracking
     """
 
     def __init__(self, model_path=None):
@@ -153,6 +154,10 @@ class LineFollower:
         self._ema_correction = 0.0
         self._ema_lane_width = None   # tracked lane width in pixels
         self._morph_kernel = None
+
+        # Canny detector (loaded lazily)
+        self._canny_detector = None
+        self._canny_available = False
 
         if not TORCH_AVAILABLE:
             logger.warning("LineFollower: PyTorch missing, using fallback OpenCV-only mode")
@@ -188,6 +193,36 @@ class LineFollower:
             logger.error(f"Failed to load model: {e} — fallback mode")
             self._init_cv2_fallback()
 
+        # Try loading canny detector for fusion
+        self._init_canny_detector()
+
+    def _init_canny_detector(self):
+        """Lazily initialise the canny edge detector for fusion mode."""
+        try:
+            import sys
+            canny_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                      '..', 'canny-edge-detection-main')
+            if canny_path not in sys.path:
+                sys.path.insert(0, canny_path)
+            from test_1_improved import PointsOfOrientationLane
+            self._canny_detector = PointsOfOrientationLane(
+                n_heights=10,
+                roi_top_frac=0.55,
+                heights_frac=(0.92, 0.60),
+                canny1=50,
+                canny2=150,
+                search_margin_px=220,
+                min_lane_width_px=30,
+                ema_center_alpha=0.35,
+                max_frames_lost=30,
+                use_virtual_markers=True,
+            )
+            self._canny_available = True
+            logger.info("✅ Canny detector loaded for fusion lane following")
+        except Exception as e:
+            self._canny_available = False
+            logger.debug(f"Canny detector not available for fusion: {e}")
+
     # ── Fallback: simple colour thresholding (no model needed) ──
     def _init_cv2_fallback(self):
         try:
@@ -215,6 +250,7 @@ class LineFollower:
     def analyse_frame(self, jpeg_bytes):
         """
         Analyse a JPEG frame and return EMA-smoothed steering correction [-1 … +1].
+        Uses UNet + optional Canny fusion for better lane following.
         Returns 0.0 on any error.
         """
         if not self._ready or jpeg_bytes is None:
@@ -230,10 +266,43 @@ class LineFollower:
             mask = self._clean_mask(mask)
             roi_top = int(mask.shape[0] * ROI_TOP_FRAC)
             roi = mask[roi_top:, :]
-            raw = self._lane_gap_offset(roi)
+            unet_raw = self._lane_gap_offset(roi)
+
+            # Canny fusion: get centroid-based steering from canny detector
+            canny_raw = 0.0
+            canny_weight = 0.0
+            if self._canny_available and self._canny_detector is not None:
+                try:
+                    h, w = frame.shape[:2]
+                    centers, lefts, rights, debug = self._canny_detector.detect(frame)
+                    steer, target = self._canny_detector.compute_steering(centers, w, k_gain=1.0)
+                    if steer is not None:
+                        canny_raw = steer
+                        quality = debug.get('quality', 0)
+                        # Higher quality = more trust in canny
+                        canny_weight = min(0.4, quality * 0.5)
+                        virtual = debug.get('virtual_markers', {})
+                        if virtual.get('used_virtual_left') or virtual.get('used_virtual_right'):
+                            # Using virtual markers = partial lane loss, trust canny more
+                            canny_weight = min(0.6, canny_weight + 0.15)
+                            logger.debug(f"Virtual markers active: canny_weight={canny_weight:.2f}")
+                except Exception as e:
+                    logger.debug(f"Canny fusion error: {e}")
+
+            # Blend UNet and Canny
+            unet_weight = 1.0 - canny_weight
+            raw = unet_weight * unet_raw + canny_weight * canny_raw
 
             # EMA smoothing
             self._ema_correction = EMA_ALPHA * raw + (1.0 - EMA_ALPHA) * self._ema_correction
+
+            if abs(canny_raw) > 0.01 or abs(unet_raw) > 0.01:
+                logger.debug(
+                    f"Lane: unet={unet_raw:+.3f} canny={canny_raw:+.3f} "
+                    f"blend={raw:+.3f} ema={self._ema_correction:+.3f} "
+                    f"canny_w={canny_weight:.2f}"
+                )
+
             return self._ema_correction
         except Exception as e:
             logger.debug(f"analyse_frame error: {e}")

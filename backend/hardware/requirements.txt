@@ -2,3 +2,5 @@ aiohttp>=3.9.0
 python-socketio[asyncio_client]>=5.11.0
 aiohttp-cors>=0.7.0
 pyserial>=3.5
+opencv-python-headless>=4.8.0
+numpy>=1.24.0

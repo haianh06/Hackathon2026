@@ -264,7 +264,7 @@ class AutoNavigator:
 
     # ── Calibration (adjust to your chassis / wheel diameter) ──
     DRIVE_TIME_PER_PIXEL  = 0.008    # seconds per canvas-pixel of distance
-    TURN_90_TIME          = 1.40     # seconds for a 90° pivot  (doubled from 0.70)
+    TURN_90_TIME          = 1.60     # seconds for a 90° pivot  (calibrated for full rotation)
     TURN_CORRECTION       = 1.05     # 5 % over-rotate to counteract drift
     DRIFT_CORRECTION_TIME = 0.10     # short counter-steer pulse after each turn
     POSITION_REPORT_INTERVAL = 0.40  # seconds between intermediate position reports

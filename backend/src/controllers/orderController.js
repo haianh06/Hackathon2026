@@ -1,5 +1,6 @@
 const orderService = require('../services/orderService');
 const mapService = require('../services/mapService');
+const notificationService = require('../services/notificationService');
 
 class OrderController {
     async create(req, res) {
@@ -89,16 +90,31 @@ class OrderController {
             if (io) {
                 io.emit('order-confirmed', { order, path });
 
+                // Notify customer that order is confirmed
+                if (order.customer) {
+                    try {
+                        await notificationService.createAndEmit(io, {
+                            user: order.customer,
+                            order: order._id,
+                            type: 'order_confirmed',
+                            title: 'Đơn hàng đã được xác nhận!',
+                            message: `Đơn hàng #${order._id.toString().slice(-6).toUpperCase()} đã được xác nhận. Xe đang trên đường giao đến điểm ${order.destinationPoint}.`
+                        });
+                    } catch (notifErr) {
+                        console.error('Error creating confirm notification:', notifErr);
+                    }
+                }
+
                 if (path && path.length >= 2) {
-                    const returnPath = await mapService.findPath(order.destinationPoint, 'S');
                     const pathData = path.map(p => ({ pointId: p.pointId, x: p.x, y: p.y }));
-                    const returnData = returnPath ? returnPath.map(p => ({ pointId: p.pointId, x: p.x, y: p.y })) : [];
 
                     await orderService.startDelivery(req.params.id);
 
+                    // Only send delivery path, no return path
+                    // Vehicle will return after customer confirms
                     io.to('hardware').emit('auto-navigate', {
                         path: pathData,
-                        returnPath: returnData,
+                        returnPath: [],
                         orderId: order._id.toString()
                     });
                 }
@@ -123,6 +139,61 @@ class OrderController {
             }
 
             res.json({ success: true, data: order });
+        } catch (error) {
+            res.status(500).json({ success: false, message: error.message });
+        }
+    }
+
+    // Customer confirms they received the order -> vehicle returns to start
+    async customerConfirm(req, res) {
+        try {
+            const order = await orderService.getOrderById(req.params.id);
+            if (!order) {
+                return res.status(404).json({ success: false, message: 'Không tìm thấy đơn hàng' });
+            }
+
+            if (order.status !== 'arrived') {
+                return res.status(400).json({ success: false, message: 'Đơn hàng chưa đến nơi' });
+            }
+
+            // Mark as delivered
+            const updatedOrder = await orderService.markDelivered(req.params.id);
+
+            const io = req.app.get('io');
+            if (io) {
+                io.emit('order-delivered', updatedOrder);
+
+                // Save completion notification for customer
+                if (order.customer) {
+                    try {
+                        const customerId = order.customer._id || order.customer;
+                        await notificationService.createAndEmit(io, {
+                            user: customerId,
+                            order: updatedOrder._id,
+                            type: 'order_delivered',
+                            title: 'Giao hàng hoàn tất!',
+                            message: `Đơn hàng #${updatedOrder._id.toString().slice(-6).toUpperCase()} đã được giao thành công. Cảm ơn bạn!`
+                        });
+                    } catch (notifErr) {
+                        console.error('Error creating delivery notification:', notifErr);
+                    }
+                }
+
+                // Auto-navigate vehicle back to start
+                const returnPath = await mapService.findPath(order.destinationPoint, 'S');
+                if (returnPath && returnPath.length >= 2) {
+                    const returnData = returnPath.map(p => ({ pointId: p.pointId, x: p.x, y: p.y }));
+                    io.to('hardware').emit('auto-navigate', {
+                        path: returnData,
+                        returnPath: [],
+                        orderId: order._id.toString(),
+                        isReturn: true
+                    });
+                    io.emit('vehicle-returning', { orderId: order._id.toString(), path: returnPath });
+                }
+            }
+
+            res.json({ success: true, data: updatedOrder });
         } catch (error) {
             res.status(500).json({ success: false, message: error.message });
         }

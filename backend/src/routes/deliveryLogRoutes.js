@@ -26,6 +26,17 @@ router.get('/stats', authenticate, authorize('admin'), async (req, res) => {
     }
 });
 
+// GET /api/delivery-logs/order/:orderId — get log by order ID
+router.get('/order/:orderId', authenticate, async (req, res) => {
+    try {
+        const log = await deliveryLogService.getByOrderId(req.params.orderId);
+        if (!log) return res.status(404).json({ success: false, message: 'Log not found for this order' });
+        res.json({ success: true, data: log });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
 // GET /api/delivery-logs/:id
 router.get('/:id', authenticate, async (req, res) => {
     try {

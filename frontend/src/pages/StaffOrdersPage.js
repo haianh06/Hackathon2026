@@ -1,16 +1,18 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { getOrders, getPendingOrders, confirmOrder, markDelivered, cancelOrder } from '../services/api';
+import { getOrders, getPendingOrders, confirmOrder, cancelOrder, getMapPoints, getVehicleStatus, findPath } from '../services/api';
 import socket from '../services/socket';
+import DemoMap from '../components/DemoMap';
 import {
     CheckCircleIcon, TruckIcon, XCircleIcon, ClockIcon,
-    ArrowPathIcon, FunnelIcon
+    ArrowPathIcon, FunnelIcon, MapIcon
 } from '@heroicons/react/24/outline';
 
 const statusConfig = {
     pending: { label: 'Chờ xác nhận', color: 'bg-yellow-100 text-yellow-700 border-yellow-200', icon: ClockIcon },
     confirmed: { label: 'Đã xác nhận', color: 'bg-blue-100 text-blue-700 border-blue-200', icon: CheckCircleIcon },
     delivering: { label: 'Đang giao', color: 'bg-amber-100 text-amber-700 border-amber-200', icon: TruckIcon },
-    delivered: { label: 'Đã giao', color: 'bg-green-100 text-green-700 border-green-200', icon: CheckCircleIcon },
+    arrived: { label: 'Đã đến nơi', color: 'bg-green-100 text-green-700 border-green-200', icon: CheckCircleIcon },
+    delivered: { label: 'Hoàn thành', color: 'bg-green-100 text-green-700 border-green-200', icon: CheckCircleIcon },
     cancelled: { label: 'Đã huỷ', color: 'bg-red-100 text-red-700 border-red-200', icon: XCircleIcon },
 };
 
@@ -20,6 +22,77 @@ export default function StaffOrdersPage() {
     const [loading, setLoading] = useState(true);
     const [notification, setNotification] = useState(null);
     const [confirming, setConfirming] = useState(null);
+
+    // Map state
+    const [mapPoints, setMapPoints] = useState([]);
+    const [expandedMapOrders, setExpandedMapOrders] = useState({}); // orderId -> { path, livePos }
+    const [livePos, setLivePos] = useState(null);
+    const [vehiclePosition, setVehiclePosition] = useState(null);
+
+    // Load map points once
+    useEffect(() => {
+        (async () => {
+            try {
+                const [mapRes, vehicleRes] = await Promise.all([getMapPoints(), getVehicleStatus()]);
+                setMapPoints(mapRes.data.data || []);
+                if (vehicleRes.data.data) setVehiclePosition(vehicleRes.data.data.currentPosition);
+            } catch (e) { console.error(e); }
+        })();
+    }, []);
+
+    // Listen for live vehicle position
+    useEffect(() => {
+        const handleNavLog = (data) => {
+            if (data.type === 'moving' || data.type === 'waypoint' || data.type === 'start') {
+                if (data.x != null && data.y != null) {
+                    setLivePos({ x: data.x, y: data.y });
+                }
+            }
+            if (data.type === 'complete' || data.type === 'cancelled') {
+                setLivePos(null);
+            }
+        };
+        const handleVehiclePos = (data) => {
+            if (data.pointId) setVehiclePosition(data.pointId);
+        };
+
+        socket.on('navigation-log', handleNavLog);
+        socket.on('vehicle-position', handleVehiclePos);
+        socket.on('vehicle-returned', () => { setLivePos(null); setVehiclePosition('S'); });
+
+        return () => {
+            socket.off('navigation-log', handleNavLog);
+            socket.off('vehicle-position', handleVehiclePos);
+            socket.off('vehicle-returned');
+        };
+    }, []);
+
+    const toggleMapForOrder = async (orderId, destinationPoint) => {
+        if (expandedMapOrders[orderId]) {
+            // Close map
+            setExpandedMapOrders(prev => {
+                const next = { ...prev };
+                delete next[orderId];
+                return next;
+            });
+            return;
+        }
+        // Open map: fetch path from S to destinationPoint
+        try {
+            const res = await findPath('S', destinationPoint);
+            setExpandedMapOrders(prev => ({
+                ...prev,
+                [orderId]: { path: res.data.data }
+            }));
+        } catch (e) {
+            console.error('Error finding path:', e);
+            // Still show map without path
+            setExpandedMapOrders(prev => ({
+                ...prev,
+                [orderId]: { path: null }
+            }));
+        }
+    };
 
     const loadOrders = useCallback(async () => {
         try {
@@ -43,12 +116,14 @@ export default function StaffOrdersPage() {
         socket.on('order-confirmed', loadOrders);
         socket.on('order-delivered', loadOrders);
         socket.on('order-cancelled', loadOrders);
+        socket.on('order-arrived', loadOrders);
 
         return () => {
             socket.off('new-order');
             socket.off('order-confirmed');
             socket.off('order-delivered');
             socket.off('order-cancelled');
+            socket.off('order-arrived');
         };
     }, [loadOrders]);
 
@@ -73,16 +148,6 @@ export default function StaffOrdersPage() {
         }
     };
 
-    const handleDeliver = async (orderId) => {
-        try {
-            await markDelivered(orderId);
-            setNotification({ message: 'Đã đánh dấu giao thành công!', type: 'success' });
-            loadOrders();
-        } catch (err) {
-            setNotification({ message: 'Lỗi cập nhật', type: 'error' });
-        }
-    };
-
     const handleCancel = async (orderId) => {
         try {
             await cancelOrder(orderId);
@@ -101,8 +166,8 @@ export default function StaffOrdersPage() {
             {/* Notification toast */}
             {notification && (
                 <div className={`fixed top-4 right-4 z-50 px-4 py-3 rounded-lg shadow-lg text-sm font-medium animate-pulse ${notification.type === 'success' ? 'bg-green-500 text-white' :
-                        notification.type === 'error' ? 'bg-red-500 text-white' :
-                            'bg-blue-500 text-white'
+                    notification.type === 'error' ? 'bg-red-500 text-white' :
+                        'bg-blue-500 text-white'
                     }`}>
                     {notification.message}
                 </div>
@@ -140,8 +205,8 @@ export default function StaffOrdersPage() {
                     <button key={tab.key}
                         onClick={() => setFilter(tab.key)}
                         className={`px-4 py-2 rounded-lg text-sm font-medium transition ${filter === tab.key
-                                ? 'bg-amber-500 text-white shadow'
-                                : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+                            ? 'bg-amber-500 text-white shadow'
+                            : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
                             }`}>
                         <FunnelIcon className="w-4 h-4 inline mr-1" />
                         {tab.label}
@@ -164,6 +229,7 @@ export default function StaffOrdersPage() {
                         const Icon = cfg.icon;
                         const isPending = order.status === 'pending';
                         const isDelivering = order.status === 'delivering' || order.status === 'confirmed';
+                        const isArrived = order.status === 'arrived';
 
                         return (
                             <div key={order._id} className={`bg-white rounded-xl border p-5 ${isPending ? 'border-yellow-300 ring-1 ring-yellow-100' : 'border-gray-200'}`}>
@@ -200,37 +266,67 @@ export default function StaffOrdersPage() {
                                 </div>
 
                                 {/* Action buttons */}
-                                {(isPending || isDelivering) && (
-                                    <div className="flex gap-2 mt-4 pt-3 border-t">
-                                        {isPending && (
-                                            <button
-                                                onClick={() => handleConfirm(order._id)}
-                                                disabled={confirming === order._id}
-                                                className="flex-1 inline-flex items-center justify-center gap-1.5 px-4 py-2 bg-amber-500 text-white rounded-lg text-sm font-medium hover:bg-amber-600 disabled:opacity-50 transition">
-                                                {confirming === order._id ? (
-                                                    <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
-                                                ) : (
-                                                    <TruckIcon className="w-4 h-4" />
-                                                )}
-                                                Xác nhận & Giao hàng tự động
-                                            </button>
-                                        )}
-                                        {isDelivering && (
-                                            <button
-                                                onClick={() => handleDeliver(order._id)}
-                                                className="flex-1 inline-flex items-center justify-center gap-1.5 px-4 py-2 bg-green-500 text-white rounded-lg text-sm font-medium hover:bg-green-600 transition">
-                                                <CheckCircleIcon className="w-4 h-4" />
-                                                Đã giao xong
-                                            </button>
-                                        )}
-                                        {(isPending || isDelivering) && (
-                                            <button
-                                                onClick={() => handleCancel(order._id)}
-                                                className="inline-flex items-center justify-center gap-1.5 px-4 py-2 bg-red-50 text-red-600 rounded-lg text-sm font-medium hover:bg-red-100 transition">
-                                                <XCircleIcon className="w-4 h-4" />
-                                                Huỷ
-                                            </button>
-                                        )}
+                                <div className="flex gap-2 mt-4 pt-3 border-t">
+                                    {isPending && (
+                                        <button
+                                            onClick={() => handleConfirm(order._id)}
+                                            disabled={confirming === order._id}
+                                            className="flex-1 inline-flex items-center justify-center gap-1.5 px-4 py-2 bg-amber-500 text-white rounded-lg text-sm font-medium hover:bg-amber-600 disabled:opacity-50 transition">
+                                            {confirming === order._id ? (
+                                                <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                                            ) : (
+                                                <TruckIcon className="w-4 h-4" />
+                                            )}
+                                            Xác nhận & Giao hàng tự động
+                                        </button>
+                                    )}
+                                    {isArrived && (
+                                        <div className="flex-1 inline-flex items-center justify-center gap-1.5 px-4 py-2 bg-green-50 text-green-700 rounded-lg text-sm font-medium border border-green-200">
+                                            <CheckCircleIcon className="w-4 h-4" />
+                                            Chờ khách hàng xác nhận
+                                        </div>
+                                    )}
+                                    <button
+                                        onClick={() => toggleMapForOrder(order._id, order.destinationPoint)}
+                                        className={`inline-flex items-center justify-center gap-1.5 px-4 py-2 rounded-lg text-sm font-medium transition ${expandedMapOrders[order._id]
+                                            ? 'bg-blue-500 text-white hover:bg-blue-600'
+                                            : 'bg-blue-50 text-blue-600 hover:bg-blue-100'
+                                            }`}>
+                                        <MapIcon className="w-4 h-4" />
+                                        {expandedMapOrders[order._id] ? 'Ẩn Map' : 'Xem Map'}
+                                    </button>
+                                    {(isPending || isDelivering || isArrived) && (
+                                        <button
+                                            onClick={() => handleCancel(order._id)}
+                                            className="inline-flex items-center justify-center gap-1.5 px-4 py-2 bg-red-50 text-red-600 rounded-lg text-sm font-medium hover:bg-red-100 transition">
+                                            <XCircleIcon className="w-4 h-4" />
+                                            Huỷ
+                                        </button>
+                                    )}
+                                </div>
+
+                                {/* Inline Map for this order */}
+                                {expandedMapOrders[order._id] && mapPoints.length > 0 && (
+                                    <div className="mt-4 pt-4 border-t border-gray-100">
+                                        <div className="flex items-center gap-2 mb-3">
+                                            <MapIcon className="w-4 h-4 text-blue-500" />
+                                            <span className="text-sm font-medium text-gray-700">
+                                                Bản đồ giao hàng — Điểm giao: <span className="text-blue-600 font-bold">{order.destinationPoint}</span>
+                                            </span>
+                                        </div>
+                                        <div className="bg-gray-50 rounded-xl p-3 border border-gray-100">
+                                            <DemoMap
+                                                points={mapPoints}
+                                                vehiclePosition={vehiclePosition}
+                                                activePath={expandedMapOrders[order._id].path}
+                                                livePos={isDelivering ? livePos : null}
+                                            />
+                                            {expandedMapOrders[order._id].path && (
+                                                <div className="mt-2 text-xs text-gray-500 text-center">
+                                                    Tuyến: {expandedMapOrders[order._id].path.map(p => p.pointId).join(' → ')}
+                                                </div>
+                                            )}
+                                        </div>
                                     </div>
                                 )}
                             </div>

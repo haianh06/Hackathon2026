@@ -10,6 +10,7 @@ router.get('/my', authenticate, orderController.getMyOrders);
 router.get('/:id', optionalAuth, orderController.getById);
 router.put('/:id/confirm', authenticate, authorize('staff', 'admin'), orderController.confirm);
 router.put('/:id/delivered', authenticate, authorize('staff', 'admin'), orderController.markDelivered);
+router.put('/:id/customer-confirm', authenticate, orderController.customerConfirm);
 router.put('/:id/cancel', authenticate, authorize('staff', 'admin'), orderController.cancel);
 
 module.exports = router;

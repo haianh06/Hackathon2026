@@ -1,15 +1,14 @@
 import React, { useState } from 'react';
 import { Link, useLocation, Outlet, Navigate } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
+import NotificationBell from '../components/NotificationBell';
 import {
     TruckIcon,
     ShoppingCartIcon,
     ClipboardDocumentListIcon,
     Cog6ToothIcon,
     MapIcon,
-    VideoCameraIcon,
     ChartBarIcon,
-    WrenchScrewdriverIcon,
     ArrowRightOnRectangleIcon,
     Bars3Icon,
     XMarkIcon,
@@ -24,20 +23,17 @@ const navConfig = {
     ],
     staff: [
         { to: '/staff/orders', icon: ClipboardDocumentListIcon, label: 'Đơn hàng' },
-        { to: '/staff/control', icon: Cog6ToothIcon, label: 'Điều khiển xe' },
-        { to: '/staff/camera', icon: VideoCameraIcon, label: 'Camera & Log' },
+        { to: '/staff/control', icon: Cog6ToothIcon, label: 'Điều khiển & Camera' },
     ],
     admin: [
         { to: '/admin', icon: ChartBarIcon, label: 'Dashboard' },
         { to: '/admin/logs', icon: ClipboardDocumentListIcon, label: 'Delivery Logs' },
+        { to: '/admin/map-builder', icon: MapIcon, label: 'Map Builder' },
+        { to: '/map', icon: TruckIcon, label: 'Bản đồ & Xe' },
     ],
 };
 
-// Extra links for staff/admin
-const devLinks = [
-    { to: '/map', icon: MapIcon, label: 'Bản đồ' },
-    { to: '/dev', icon: WrenchScrewdriverIcon, label: 'Dev Debug' },
-];
+// Dev links removed — merged into Map Builder page
 
 export default function MainLayout() {
     const { user, logout } = useAuth();
@@ -48,7 +44,7 @@ export default function MainLayout() {
 
     const role = user.role || 'customer';
     const links = navConfig[role] || navConfig.customer;
-    const showDevLinks = role === 'staff' || role === 'admin';
+
 
     const roleLabel = { customer: 'Customer', staff: 'Staff', admin: 'Admin' }[role];
     const roleBadgeColor = { customer: 'bg-green-100 text-green-700', staff: 'bg-blue-100 text-blue-700', admin: 'bg-purple-100 text-purple-700' }[role];
@@ -87,8 +83,8 @@ export default function MainLayout() {
                                 to={item.to}
                                 onClick={() => setSidebarOpen(false)}
                                 className={`flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors ${active
-                                        ? 'bg-amber-50 text-amber-700'
-                                        : 'text-gray-600 hover:bg-gray-50 hover:text-gray-900'
+                                    ? 'bg-amber-50 text-amber-700'
+                                    : 'text-gray-600 hover:bg-gray-50 hover:text-gray-900'
                                     }`}
                             >
                                 <item.icon className={`w-5 h-5 ${active ? 'text-amber-500' : 'text-gray-400'}`} />
@@ -97,30 +93,7 @@ export default function MainLayout() {
                         );
                     })}
 
-                    {showDevLinks && (
-                        <>
-                            <div className="pt-4 pb-2">
-                                <p className="px-3 text-xs font-semibold text-gray-400 uppercase tracking-wider">Dev Tools</p>
-                            </div>
-                            {devLinks.map((item) => {
-                                const active = location.pathname === item.to;
-                                return (
-                                    <Link
-                                        key={item.to}
-                                        to={item.to}
-                                        onClick={() => setSidebarOpen(false)}
-                                        className={`flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors ${active
-                                                ? 'bg-amber-50 text-amber-700'
-                                                : 'text-gray-600 hover:bg-gray-50 hover:text-gray-900'
-                                            }`}
-                                    >
-                                        <item.icon className={`w-5 h-5 ${active ? 'text-amber-500' : 'text-gray-400'}`} />
-                                        {item.label}
-                                    </Link>
-                                );
-                            })}
-                        </>
-                    )}
+
                 </nav>
 
                 {/* User info */}
@@ -152,9 +125,10 @@ export default function MainLayout() {
                         <span className="font-bold text-gray-900">DeliverBot</span>
                     </div>
                     <div className="flex-1" />
-                    <div className="hidden lg:flex items-center gap-3">
-                        <span className="text-sm text-gray-500">{user.displayName}</span>
-                        <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${roleBadgeColor}`}>
+                    <div className="flex items-center gap-3">
+                        <NotificationBell />
+                        <span className="hidden lg:inline text-sm text-gray-500">{user.displayName}</span>
+                        <span className={`hidden lg:inline text-xs px-2 py-0.5 rounded-full font-medium ${roleBadgeColor}`}>
                             {roleLabel}
                         </span>
                     </div>

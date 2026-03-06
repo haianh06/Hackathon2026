@@ -171,7 +171,6 @@ class CameraManager:
                 'Content-Type': 'multipart/x-mixed-replace; boundary=frame',
                 'Cache-Control': 'no-cache, no-store, must-revalidate',
                 'Pragma': 'no-cache',
-                'Access-Control-Allow-Origin': '*',
             },
         )
         await response.prepare(request)
@@ -203,7 +202,7 @@ class CameraManager:
         return web.Response(
             body=frame,
             content_type='image/jpeg',
-            headers={'Cache-Control': 'no-cache', 'Access-Control-Allow-Origin': '*'},
+            headers={'Cache-Control': 'no-cache'},
         )
 
     async def handle_status(self, request):

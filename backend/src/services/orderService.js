@@ -75,10 +75,19 @@ class OrderService {
         return order;
     }
 
+    async markArrived(id) {
+        const order = await Order.findByIdAndUpdate(
+            id,
+            { status: 'arrived', vehicleStatus: 'arrived' },
+            { new: true }
+        );
+        return order;
+    }
+
     async markDelivered(id) {
         const order = await Order.findByIdAndUpdate(
             id,
-            { status: 'delivered', vehicleStatus: 'arrived' },
+            { status: 'delivered', vehicleStatus: 'idle' },
             { new: true }
         );
         if (order) {
@@ -91,6 +100,12 @@ class OrderService {
             }
         }
         return order;
+    }
+
+    async getDeliveringOrders() {
+        return await Order.find({ status: { $in: ['delivering', 'confirmed'] } })
+            .populate('customer', 'displayName username')
+            .sort({ createdAt: -1 });
     }
 
     async cancelOrder(id) {
