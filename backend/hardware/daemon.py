@@ -87,12 +87,15 @@ class HardwareDaemon:
         self._map_direction = 0  # 0=up(+y), 1=right(+x), 2=down(-y), 3=left(-x)
         self._map_step_count = 0
         self._canny_detector = CannyLaneDetector(
-            n_heights=10, roi_top_frac=0.55,
+            n_heights=12, roi_top_frac=0.50,
             heights_frac=(0.92, 0.60),
             canny1=50, canny2=150,
             search_margin_px=220, min_lane_width_px=30,
-            ema_center_alpha=0.35, max_frames_lost=30,
-            use_virtual_markers=True
+            ema_center_alpha=0.30, max_frames_lost=45,
+            use_virtual_markers=True,
+            use_bev=True,
+            use_sliding_window=True,
+            frame_w=640, frame_h=480,
         ) if CANNY_AVAILABLE else None
 
         # ── Drift correction state ──
@@ -320,6 +323,15 @@ class HardwareDaemon:
                     virtual_info += " [VIRTUAL-L]"
                 if canny_analysis.get('virtualRight'):
                     virtual_info += " [VIRTUAL-R]"
+                if canny_analysis.get('usedReference'):
+                    virtual_info += " [REF-RECOVERY]"
+                if canny_analysis.get('isJunction'):
+                    virtual_info += " [JUNCTION]"
+                if canny_analysis.get('turnDetected'):
+                    td = canny_analysis.get('turnDirection', 0)
+                    virtual_info += f" [90-TURN-{'L' if td < 0 else 'R'}]"
+                method = canny_analysis.get('detectionMethod', '?')
+                virtual_info += f" method={method}"
             logger.info(
                 f"MAP-STEP: canny={canny_steer:+.3f} unet={unet_steer:+.3f} "
                 f"combined={combined_steer:+.3f} drift_bias={self._drift_bias:+.3f} "
@@ -356,6 +368,12 @@ class HardwareDaemon:
                     'laneQuality': canny_quality,
                     'virtualLeft': canny_analysis.get('virtualLeft', False) if canny_analysis else False,
                     'virtualRight': canny_analysis.get('virtualRight', False) if canny_analysis else False,
+                    'usedReference': canny_analysis.get('usedReference', False) if canny_analysis else False,
+                    'detectionMethod': canny_analysis.get('detectionMethod', 'unknown') if canny_analysis else 'none',
+                    'isJunction': canny_analysis.get('isJunction', False) if canny_analysis else False,
+                    'turnDetected': canny_analysis.get('turnDetected', False) if canny_analysis else False,
+                    'turnDirection': canny_analysis.get('turnDirection', 0) if canny_analysis else 0,
+                    'referenceSet': canny_analysis.get('referenceSet', False) if canny_analysis else False,
                     'centersCount': canny_analysis.get('centersCount', 0) if canny_analysis else 0,
                     'driftBias': self._drift_bias,
                     'driftEma': self._drift_ema,
@@ -438,6 +456,14 @@ class HardwareDaemon:
                 'framesLost': debug.get('frames_lost', 0),
                 'virtualLeft': virtual.get('used_virtual_left', False),
                 'virtualRight': virtual.get('used_virtual_right', False),
+                'usedReference': virtual.get('used_reference', False),
+                'detectionMethod': debug.get('detection_method', 'unknown'),
+                'isJunction': debug.get('is_junction', False),
+                'turnDetected': debug.get('turn_detected', False),
+                'turnDirection': debug.get('turn_direction', 0),
+                'referenceSet': debug.get('reference_set', False),
+                'bevQuality': float(debug.get('bev_quality', 0)),
+                'scanQuality': float(debug.get('scan_quality', 0)),
             }
         except Exception as e:
             logger.error(f"Canny analysis error: {e}")

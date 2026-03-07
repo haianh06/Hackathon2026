@@ -206,16 +206,20 @@ class LineFollower:
                 sys.path.insert(0, canny_path)
             from test_1_improved import PointsOfOrientationLane
             self._canny_detector = PointsOfOrientationLane(
-                n_heights=10,
-                roi_top_frac=0.55,
+                n_heights=12,
+                roi_top_frac=0.50,
                 heights_frac=(0.92, 0.60),
                 canny1=50,
                 canny2=150,
                 search_margin_px=220,
                 min_lane_width_px=30,
-                ema_center_alpha=0.35,
-                max_frames_lost=30,
+                ema_center_alpha=0.30,
+                max_frames_lost=45,
                 use_virtual_markers=True,
+                use_bev=True,
+                use_sliding_window=True,
+                frame_w=640,
+                frame_h=480,
             )
             self._canny_available = True
             logger.info("✅ Canny detector loaded for fusion lane following")
