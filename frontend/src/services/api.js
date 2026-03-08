@@ -77,4 +77,10 @@ export const getUnreadNotificationCount = () => api.get('/notifications/unread-c
 export const markNotificationRead = (id) => api.put(`/notifications/${id}/read`);
 export const markAllNotificationsRead = () => api.put('/notifications/read-all');
 
+// RFID
+export const getRfids = () => api.get('/rfid');
+export const lookupRfid = (rfidId) => api.get(`/rfid/${rfidId}`);
+export const saveRfid = (data) => api.post('/rfid', data);
+export const deleteRfid = (rfidId) => api.delete(`/rfid/${rfidId}`);
+
 export default api;

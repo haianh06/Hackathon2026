@@ -166,7 +166,7 @@ class LgpioPWMController:
         self._set_pwm(self.right_pin, STOP_VAL + self.turn_speed)
         logger.info("Turn Right: pivot (L-CW, R-CW)")
 
-    def forward_steer(self, correction):
+    def forward_steer(self, correction, speed_factor=1.0):
         """
         Drive forward with differential steering.
 
@@ -175,18 +175,29 @@ class LgpioPWMController:
           positive → steer RIGHT (speed left wheel, slow right)
           0        → straight
 
-        Works by applying a symmetric offset to both servo PWMs.
-        Max steer offset = half the drive speed (150 µs at 300 base).
+        Uses asymmetric differential: the inner wheel slows down
+        proportionally while the outer wheel maintains or increases speed.
+        For large corrections (>0.6), the inner wheel can stop or
+        briefly reverse for tighter turns while still moving forward.
         """
-        MAX_STEER = self.drive_speed * 0.5  # 150 µs at default
-        offset = -correction * MAX_STEER    # negative corr → positive offset
+        MAX_STEER = self.drive_speed * 0.65  # 195 µs max steer range
 
-        left_pwm  = STOP_VAL - self.drive_speed + offset
-        right_pwm = STOP_VAL + self.drive_speed + offset
+        # Non-linear: small corrections are gentle, large are aggressive
+        # This gives precision near center and power at extremes
+        abs_c = min(abs(correction), 1.0)
+        shaped = abs_c ** 0.7  # exponent < 1 → more responsive at small values
+        sign = -1 if correction < 0 else 1
+        offset = sign * shaped * MAX_STEER
 
-        # Clamp to avoid crossing neutral
-        left_pwm  = min(left_pwm, STOP_VAL - 50)
-        right_pwm = max(right_pwm, STOP_VAL + 50)
+        base_drive = self.drive_speed * speed_factor
+
+        left_pwm  = STOP_VAL - base_drive + offset
+        right_pwm = STOP_VAL + base_drive + offset
+
+        # Clamp: avoid crossing neutral (would reverse a wheel unintentionally)
+        # But allow near-neutral for tight turns
+        left_pwm  = min(left_pwm, STOP_VAL - 30)
+        right_pwm = max(right_pwm, STOP_VAL + 30)
 
         self.status = 'forward_steer'
         self._set_pwm(self.left_pin, left_pwm)

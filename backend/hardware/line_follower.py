@@ -272,39 +272,51 @@ class LineFollower:
             roi = mask[roi_top:, :]
             unet_raw = self._lane_gap_offset(roi)
 
-            # Canny fusion: get centroid-based steering from canny detector
+            # Canny = PRIMARY steering (points of orientation, edge centering)
+            # UNet  = SECONDARY validation (is this a drivable lane?)
             canny_raw = 0.0
-            canny_weight = 0.0
+            canny_available_now = False
             if self._canny_available and self._canny_detector is not None:
                 try:
                     h, w = frame.shape[:2]
                     centers, lefts, rights, debug = self._canny_detector.detect(frame)
-                    steer, target = self._canny_detector.compute_steering(centers, w, k_gain=1.0)
+                    steer, target, _ = self._canny_detector.compute_steering(centers, w, k_gain=1.0)
                     if steer is not None:
                         canny_raw = steer
-                        quality = debug.get('quality', 0)
-                        # Higher quality = more trust in canny
-                        canny_weight = min(0.4, quality * 0.5)
-                        virtual = debug.get('virtual_markers', {})
-                        if virtual.get('used_virtual_left') or virtual.get('used_virtual_right'):
-                            # Using virtual markers = partial lane loss, trust canny more
-                            canny_weight = min(0.6, canny_weight + 0.15)
-                            logger.debug(f"Virtual markers active: canny_weight={canny_weight:.2f}")
+                        canny_available_now = True
                 except Exception as e:
-                    logger.debug(f"Canny fusion error: {e}")
+                    logger.debug(f"Canny detection error: {e}")
 
-            # Blend UNet and Canny
-            unet_weight = 1.0 - canny_weight
-            raw = unet_weight * unet_raw + canny_weight * canny_raw
+            if canny_available_now:
+                # Canny decides steering direction
+                raw = canny_raw
+
+                # UNet validates: if UNet strongly disagrees, the lane may not be drivable
+                # UNet large |correction| = heading toward white border
+                if abs(unet_raw) > 0.5 and (canny_raw * unet_raw) < 0:
+                    # Canny steers one way, UNet says white line is there → emergency
+                    if abs(unet_raw) > 0.7:
+                        raw = -0.6 * np.sign(unet_raw)  # avoid white line
+                        logger.warning(
+                            f"WHITE LINE AVOID: canny={canny_raw:+.3f} unet={unet_raw:+.3f} → {raw:+.3f}"
+                        )
+                    else:
+                        raw = 0.4 * canny_raw - 0.6 * unet_raw
+                elif abs(unet_raw) > 0.7:
+                    # No canny conflict but UNet sees imminent white line
+                    raw = 0.5 * canny_raw - 0.3 * np.sign(unet_raw)
+            else:
+                # Canny unavailable → fallback to UNet
+                raw = unet_raw
 
             # EMA smoothing
             self._ema_correction = EMA_ALPHA * raw + (1.0 - EMA_ALPHA) * self._ema_correction
 
             if abs(canny_raw) > 0.01 or abs(unet_raw) > 0.01:
                 logger.debug(
-                    f"Lane: unet={unet_raw:+.3f} canny={canny_raw:+.3f} "
-                    f"blend={raw:+.3f} ema={self._ema_correction:+.3f} "
-                    f"canny_w={canny_weight:.2f}"
+                    f"Lane: canny={canny_raw:+.3f} unet={unet_raw:+.3f} "
+                    f"raw={raw:+.3f} ema={self._ema_correction:+.3f} "
+                    f"canny_primary={canny_available_now}"
                 )
 
             return self._ema_correction

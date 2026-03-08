@@ -11,5 +11,10 @@
         "width": 640,
         "height": 480,
         "fps": 15
+    },
+    "rfid": {
+        "enabled": true,
+        "bus": 0,
+        "device": 0
     }
 }

@@ -13,6 +13,7 @@ import {
     Bars3Icon,
     XMarkIcon,
     UserCircleIcon,
+    SignalIcon,
 } from '@heroicons/react/24/outline';
 import { TruckIcon as TruckSolid } from '@heroicons/react/24/solid';
 
@@ -29,6 +30,7 @@ const navConfig = {
         { to: '/admin', icon: ChartBarIcon, label: 'Dashboard' },
         { to: '/admin/logs', icon: ClipboardDocumentListIcon, label: 'Delivery Logs' },
         { to: '/admin/map-builder', icon: MapIcon, label: 'Map Builder' },
+        { to: '/admin/rfid', icon: SignalIcon, label: 'Quản lý RFID' },
         { to: '/map', icon: TruckIcon, label: 'Bản đồ & Xe' },
     ],
 };

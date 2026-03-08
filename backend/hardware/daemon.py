@@ -34,10 +34,25 @@ from motor_control import create_motor_controller, AutoNavigator
 from camera_mjpeg import CameraManager
 from line_follower import LineFollower
 
+# RFID reader (MFRC522 via SPI)
+try:
+    from mfrc522 import SimpleMFRC522
+    import spidev
+    RFID_AVAILABLE = True
+    logger.info("MFRC522 RFID reader module loaded")
+except ImportError as e:
+    RFID_AVAILABLE = False
+    logger.warning(f"RFID reader not available: {e}")
+
 # Import canny edge detection
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'canny-edge-detection-main'))
 try:
-    from test_1_improved import PointsOfOrientationLane as CannyLaneDetector, draw_debug as canny_draw_debug
+    from test_1_improved import (
+        PointsOfOrientationLane as CannyLaneDetector,
+        BirdEyeView as CannyBEV,
+        draw_overlay as canny_draw_overlay,
+        draw_bev_debug as canny_draw_bev_debug,
+    )
     CANNY_AVAILABLE = True
     logger.info("Canny edge detection loaded successfully")
 except ImportError as e:
@@ -86,23 +101,36 @@ class HardwareDaemon:
         self._map_y = 0  # grid coordinate y
         self._map_direction = 0  # 0=up(+y), 1=right(+x), 2=down(-y), 3=left(-x)
         self._map_step_count = 0
+        self._canny_bev = CannyBEV(640, 480) if CANNY_AVAILABLE else None
         self._canny_detector = CannyLaneDetector(
-            n_heights=12, roi_top_frac=0.50,
-            heights_frac=(0.92, 0.60),
-            canny1=50, canny2=150,
-            search_margin_px=220, min_lane_width_px=30,
-            ema_center_alpha=0.30, max_frames_lost=45,
+            n_heights=15,
+            search_margin_px=150,
+            min_lane_width_px=100,
+            ema_center_alpha=0.35,
+            max_frames_lost=30,
             use_virtual_markers=True,
-            use_bev=True,
-            use_sliding_window=True,
-            frame_w=640, frame_h=480,
         ) if CANNY_AVAILABLE else None
+
+        # ── RFID scanner state ──
+        self._rfid_scanning = False
+        self._rfid_reader = None
+        if RFID_AVAILABLE:
+            try:
+                self._rfid_reader = SimpleMFRC522()
+                logger.info("RFID reader initialized")
+            except Exception as e:
+                logger.warning(f"RFID reader init failed: {e}")
 
         # ── Drift correction state ──
         self._drift_history = []       # list of (steer, duration) tuples
         self._drift_bias = 0.0         # accumulated servo bias offset
         self._drift_ema = 0.0          # EMA of steering corrections
         self._drift_alpha = 0.15       # EMA alpha for drift tracking
+
+        # ── Continuous servo control state ──
+        self._servo_steer_ema = 0.0    # smoothed steer for servo
+        self._prev_steer = 0.0         # previous steer for derivative
+        self._steer_integral = 0.0     # integral term for PID
 
     async def connect_to_server(self):
         """Connect to Node.js backend via Socket.IO"""
@@ -191,6 +219,17 @@ class HardwareDaemon:
         async def on_status_request(data):
             await self.report_status()
 
+        # ====== RFID Scan Commands ======
+        @self.sio.on('rfid-start-scan')
+        async def on_rfid_start_scan(data=None):
+            logger.info("RFID: start scan requested")
+            asyncio.ensure_future(self._rfid_scan_loop())
+
+        @self.sio.on('rfid-stop-scan')
+        async def on_rfid_stop_scan(data=None):
+            logger.info("RFID: stop scan requested")
+            self._rfid_scanning = False
+
         # ====== Map Builder Mode ======
         @self.sio.on('map-build-step')
         async def on_map_build_step(data=None):
@@ -231,6 +270,7 @@ class HardwareDaemon:
             'gpio_available': True,
             'line_follower': self.line_follower.is_ready,
             'canny_available': CANNY_AVAILABLE,
+            'rfid_available': RFID_AVAILABLE and self._rfid_reader is not None,
         }
         if self.sio and self.sio.connected:
             await self.sio.emit('hardware-status', status)
@@ -245,107 +285,128 @@ class HardwareDaemon:
         return ['up (+Y)', 'right (+X)', 'down (-Y)', 'left (-X)'][self._map_direction % 4]
 
     async def _map_build_step_forward(self, data):
-        """Move one step forward with combined canny + UNet lane centering + drift correction."""
+        """
+        Move one step forward with CONTINUOUS servo adjustment.
+
+        Instead of: analyse once → steer → drive blind for N seconds → stop,
+        this uses a real-time PID loop:
+          1. Start driving forward
+          2. Every ~80ms: grab frame → BEV → detect → compute steer → adjust motor
+          3. Stop after step_duration
+
+        PID gains tuned for continuous-rotation servo differential drive.
+        """
         import time as _time
+        import cv2
+
+        # Configurable parameters
+        step_duration = data.get('duration', 0.8)
+        speed = data.get('speed', 40)
+        LOOP_INTERVAL = 0.08          # 80ms → ~12.5 Hz servo update rate
+        KP = 0.70                     # Proportional gain
+        KD = 0.25                     # Derivative gain (dampen oscillation)
+        KI = 0.05                     # Integral gain (correct persistent offset)
+        STEER_EMA_ALPHA = 0.45        # Smooth steer output to avoid servo jitter
+        DEAD_ZONE = 0.04              # Ignore tiny corrections
+        MAX_INTEGRAL = 0.3            # Clamp integral windup
+        QUALITY_MIN = 0.15            # Minimum quality to trust canny
 
         try:
-            # Get a frame and analyse with BOTH canny and UNet
-            canny_analysis = await self._do_canny_analysis()
-            unet_correction = await self._get_unet_correction()
+            # Reset PID state for this step
+            self._steer_integral = 0.0
 
-            step_duration = data.get('duration', 0.6)
-            speed = data.get('speed', 40)
+            # Start driving
+            self.motor.forward(speed)
+            start_time = _time.time()
+            last_canny_steer = 0.0
+            last_quality = 0.0
+            frames_ok = 0
 
-            # ── Primary: Canny steering (edge-based, geometrically precise) ──
-            canny_steer = canny_analysis.get('steering', 0.0) if canny_analysis else 0.0
-            canny_quality = canny_analysis.get('laneQuality', 0) if canny_analysis else 0
-            unet_steer = unet_correction  # already in [-1, 1]
+            while (_time.time() - start_time) < step_duration:
+                loop_start = _time.time()
 
-            # ── Canny-primary, UNet-verification fusion ──
-            # Canny provides precise geometric centering; UNet validates lane presence
-            if canny_steer is not None and canny_quality > 0.3:
-                # High-quality canny: use canny as primary
-                if abs(unet_steer) > 0.01:
-                    # Check agreement: if UNet & Canny agree on direction, trust more
-                    direction_agree = (canny_steer * unet_steer) >= 0  # same sign
-                    if direction_agree:
-                        # Both agree → use canny (more precise), UNet confirms
-                        combined_steer = 0.75 * canny_steer + 0.25 * unet_steer
-                    else:
-                        # Disagree → reduce confidence, use weighted average
-                        combined_steer = 0.50 * canny_steer + 0.50 * unet_steer
+                # ── Grab frame and detect ──
+                canny_steer = 0.0
+                quality = 0.0
+                centers_count = 0
+                virtual_info_str = ""
+
+                frame_bytes = await self.camera.get_latest_frame()
+                if frame_bytes and CANNY_AVAILABLE and self._canny_detector and self._canny_bev:
+                    try:
+                        nparr = np.frombuffer(frame_bytes, np.uint8)
+                        frame_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                        if frame_bgr is not None:
+                            h, w = frame_bgr.shape[:2]
+                            # Warp to BEV then detect
+                            bev_frame = self._canny_bev.warp(frame_bgr)
+                            centers, lefts, rights, debug = self._canny_detector.detect(bev_frame)
+                            steer_val, target = self._canny_detector.compute_steering(
+                                centers, w, h, k_gain=1.0)
+
+                            quality = debug.get('lane_quality', 0.0)
+                            centers_count = len(centers)
+
+                            if steer_val is not None and quality >= QUALITY_MIN and centers_count >= 2:
+                                canny_steer = steer_val
+                                frames_ok += 1
+
+                            virt = debug.get('virtual_markers', {})
+                            if virt.get('used_virtual_left'):
+                                virtual_info_str += " [V-L]"
+                            if virt.get('used_virtual_right'):
+                                virtual_info_str += " [V-R]"
+                    except Exception as e:
+                        logger.debug(f"Step loop detect error: {e}")
+
+                # ── PID controller ──
+                error = canny_steer
+                derivative = error - self._prev_steer
+
+                # Only accumulate integral when error is meaningful
+                if abs(error) > DEAD_ZONE:
+                    self._steer_integral += error * LOOP_INTERVAL
+                    self._steer_integral = max(-MAX_INTEGRAL,
+                                               min(MAX_INTEGRAL, self._steer_integral))
                 else:
-                    combined_steer = canny_steer
-            elif abs(unet_steer) > 0.01:
-                # Canny weak, UNet available → fallback to UNet
-                combined_steer = unet_steer
-            else:
-                combined_steer = 0.0
+                    # Decay integral when centered
+                    self._steer_integral *= 0.8
 
-            combined_steer = max(-1.0, min(1.0, combined_steer))
+                pid_output = KP * error + KD * derivative + KI * self._steer_integral
 
-            # ── Drift correction: compensate systematic servo bias ──
-            # Track steering history to detect consistent drift
-            self._drift_ema = self._drift_alpha * combined_steer + (1 - self._drift_alpha) * self._drift_ema
+                # ── Drift bias (long-term mechanical offset) ──
+                self._drift_ema = self._drift_alpha * error + (1 - self._drift_alpha) * self._drift_ema
+                if len(self._drift_history) >= 5:
+                    recent = [s for s, _ in self._drift_history[-15:]]
+                    drift_mean = np.mean(recent)
+                    drift_std = np.std(recent) if len(recent) > 1 else 1.0
+                    if drift_std < 0.25 and abs(drift_mean) > 0.04:
+                        self._drift_bias = -0.25 * drift_mean
 
-            # If we consistently steer in one direction, there's a mechanical drift
-            # Accumulate bias slowly to counteract it
-            if abs(self._drift_ema) > 0.08 and len(self._drift_history) >= 3:
-                # Compute drift angle from recent steering history
-                recent_steers = [s for s, _ in self._drift_history[-10:]]
-                drift_mean = np.mean(recent_steers)
-                drift_std = np.std(recent_steers) if len(recent_steers) > 1 else 1.0
+                # ── Final steer with EMA smoothing ──
+                raw_steer = pid_output + self._drift_bias
+                self._servo_steer_ema = (STEER_EMA_ALPHA * raw_steer +
+                                         (1 - STEER_EMA_ALPHA) * self._servo_steer_ema)
+                final_steer = max(-1.0, min(1.0, self._servo_steer_ema))
 
-                # Only apply bias if drift is consistent (low std deviation)
-                if drift_std < 0.3 and abs(drift_mean) > 0.05:
-                    # Compute drift angle in degrees: arctan(drift_mean) * 180/pi
-                    drift_angle_deg = float(np.degrees(np.arctan(drift_mean)))
-                    # Apply counter-bias (opposite direction, scaled conservatively)
-                    self._drift_bias = -0.3 * drift_mean  # 30% counter-correction
-                    logger.info(
-                        f"DRIFT CORRECTION: angle={drift_angle_deg:+.1f}° "
-                        f"mean={drift_mean:+.3f} std={drift_std:.3f} bias={self._drift_bias:+.3f}"
-                    )
+                # ── Apply to motor ──
+                if abs(final_steer) > DEAD_ZONE:
+                    self.motor.forward_steer(final_steer)
+                else:
+                    self.motor.forward(speed)
 
-            # Apply drift bias to combined steering
-            corrected_steer = combined_steer + self._drift_bias
-            corrected_steer = max(-1.0, min(1.0, corrected_steer))
+                self._prev_steer = error
+                self._drift_history.append((error, LOOP_INTERVAL))
+                if len(self._drift_history) > 60:
+                    self._drift_history = self._drift_history[-40:]
+                last_canny_steer = canny_steer
+                last_quality = quality
 
-            # Record for drift tracking
-            self._drift_history.append((combined_steer, step_duration))
-            if len(self._drift_history) > 50:
-                self._drift_history = self._drift_history[-30:]
+                # Sleep remainder of loop interval
+                elapsed = _time.time() - loop_start
+                if elapsed < LOOP_INTERVAL:
+                    await asyncio.sleep(LOOP_INTERVAL - elapsed)
 
-            # Log detailed info
-            virtual_info = ""
-            if canny_analysis:
-                if canny_analysis.get('virtualLeft'):
-                    virtual_info += " [VIRTUAL-L]"
-                if canny_analysis.get('virtualRight'):
-                    virtual_info += " [VIRTUAL-R]"
-                if canny_analysis.get('usedReference'):
-                    virtual_info += " [REF-RECOVERY]"
-                if canny_analysis.get('isJunction'):
-                    virtual_info += " [JUNCTION]"
-                if canny_analysis.get('turnDetected'):
-                    td = canny_analysis.get('turnDirection', 0)
-                    virtual_info += f" [90-TURN-{'L' if td < 0 else 'R'}]"
-                method = canny_analysis.get('detectionMethod', '?')
-                virtual_info += f" method={method}"
-            logger.info(
-                f"MAP-STEP: canny={canny_steer:+.3f} unet={unet_steer:+.3f} "
-                f"combined={combined_steer:+.3f} drift_bias={self._drift_bias:+.3f} "
-                f"final={corrected_steer:+.3f} quality={canny_quality:.0%}"
-                f"{virtual_info}"
-            )
-
-            # Apply differential steering while moving forward
-            if abs(corrected_steer) > 0.05:
-                self.motor.forward_steer(corrected_steer)
-            else:
-                self.motor.forward(speed)
-
-            await asyncio.sleep(step_duration)
             self.motor.stop()
 
             # Update grid coordinates
@@ -354,7 +415,12 @@ class HardwareDaemon:
             self._map_y += dy
             self._map_step_count += 1
 
-            # Report position with detailed info
+            logger.info(
+                f"MAP-STEP: final_steer={final_steer:+.3f} quality={last_quality:.0%} "
+                f"frames_ok={frames_ok} drift_bias={self._drift_bias:+.3f}"
+            )
+
+            # Report position
             if self.sio and self.sio.connected:
                 await self.sio.emit('map-build-position', {
                     'x': self._map_x,
@@ -362,21 +428,10 @@ class HardwareDaemon:
                     'direction': self._map_direction,
                     'directionName': self._direction_name(),
                     'stepCount': self._map_step_count,
-                    'steering': corrected_steer,
-                    'cannySteering': canny_steer,
-                    'unetSteering': unet_steer,
-                    'laneQuality': canny_quality,
-                    'virtualLeft': canny_analysis.get('virtualLeft', False) if canny_analysis else False,
-                    'virtualRight': canny_analysis.get('virtualRight', False) if canny_analysis else False,
-                    'usedReference': canny_analysis.get('usedReference', False) if canny_analysis else False,
-                    'detectionMethod': canny_analysis.get('detectionMethod', 'unknown') if canny_analysis else 'none',
-                    'isJunction': canny_analysis.get('isJunction', False) if canny_analysis else False,
-                    'turnDetected': canny_analysis.get('turnDetected', False) if canny_analysis else False,
-                    'turnDirection': canny_analysis.get('turnDirection', 0) if canny_analysis else 0,
-                    'referenceSet': canny_analysis.get('referenceSet', False) if canny_analysis else False,
-                    'centersCount': canny_analysis.get('centersCount', 0) if canny_analysis else 0,
+                    'steering': final_steer,
+                    'laneQuality': last_quality,
+                    'framesOk': frames_ok,
                     'driftBias': self._drift_bias,
-                    'driftEma': self._drift_ema,
                     'timestamp': _time.time(),
                 })
 
@@ -389,7 +444,7 @@ class HardwareDaemon:
         import time as _time
 
         try:
-            turn_duration = 1.6  # Doubled for full 90-degree rotation
+            turn_duration = 2.0  # Doubled for full 90-degree rotation
             speed = 40
 
             if direction == 'left':
@@ -418,8 +473,8 @@ class HardwareDaemon:
             self.motor.stop()
 
     async def _do_canny_analysis(self):
-        """Run canny edge detection on current frame."""
-        if not CANNY_AVAILABLE or self._canny_detector is None:
+        """Run canny edge detection on current frame (BEV-first pipeline)."""
+        if not CANNY_AVAILABLE or self._canny_detector is None or self._canny_bev is None:
             return None
 
         frame_bytes = await self.camera.get_latest_frame()
@@ -434,8 +489,10 @@ class HardwareDaemon:
                 return None
 
             h, w = frame.shape[:2]
-            centers, lefts, rights, debug = self._canny_detector.detect(frame)
-            steer, target = self._canny_detector.compute_steering(centers, w, k_gain=1.0)
+            bev_frame = self._canny_bev.warp(frame)
+            centers, lefts, rights, debug = self._canny_detector.detect(bev_frame)
+            steer, target = self._canny_detector.compute_steering(
+                centers, w, h, k_gain=1.0)
 
             midpoint = None
             if len(centers) > 0:
@@ -446,7 +503,7 @@ class HardwareDaemon:
 
             return {
                 'steering': float(steer) if steer is not None else 0.0,
-                'laneQuality': float(debug.get('quality', 0)),
+                'laneQuality': float(debug.get('lane_quality', 0)),
                 'centersCount': len(centers),
                 'leftsCount': len(lefts),
                 'rightsCount': len(rights),
@@ -456,14 +513,6 @@ class HardwareDaemon:
                 'framesLost': debug.get('frames_lost', 0),
                 'virtualLeft': virtual.get('used_virtual_left', False),
                 'virtualRight': virtual.get('used_virtual_right', False),
-                'usedReference': virtual.get('used_reference', False),
-                'detectionMethod': debug.get('detection_method', 'unknown'),
-                'isJunction': debug.get('is_junction', False),
-                'turnDetected': debug.get('turn_detected', False),
-                'turnDirection': debug.get('turn_direction', 0),
-                'referenceSet': debug.get('reference_set', False),
-                'bevQuality': float(debug.get('bev_quality', 0)),
-                'scanQuality': float(debug.get('scan_quality', 0)),
             }
         except Exception as e:
             logger.error(f"Canny analysis error: {e}")
@@ -481,6 +530,69 @@ class HardwareDaemon:
         except Exception as e:
             logger.debug(f"UNet correction error: {e}")
             return 0.0
+
+    # ====== RFID Methods ======
+    async def _rfid_scan_loop(self):
+        """Continuously poll RFID reader until a tag is found or scan is stopped."""
+        if not RFID_AVAILABLE or self._rfid_reader is None:
+            logger.warning("RFID scan requested but reader not available")
+            if self.sio and self.sio.connected:
+                await self.sio.emit('rfid-scan-status', {
+                    'scanning': False,
+                    'error': 'RFID reader not available',
+                })
+            return
+
+        if self._rfid_scanning:
+            logger.info("RFID scan already in progress")
+            return
+
+        self._rfid_scanning = True
+        if self.sio and self.sio.connected:
+            await self.sio.emit('rfid-scan-status', {'scanning': True})
+
+        logger.info("RFID scanning started...")
+        try:
+            while self._rfid_scanning:
+                # Run blocking SPI read in executor to avoid blocking event loop
+                loop = asyncio.get_event_loop()
+                try:
+                    uid, text = await asyncio.wait_for(
+                        loop.run_in_executor(None, self._rfid_read_once),
+                        timeout=2.0
+                    )
+                except asyncio.TimeoutError:
+                    # No tag detected in this cycle, keep scanning
+                    continue
+
+                if uid:
+                    rfid_id = str(uid)
+                    logger.info(f"RFID tag detected: {rfid_id}")
+                    self._rfid_scanning = False  # Stop after successful read
+                    if self.sio and self.sio.connected:
+                        await self.sio.emit('rfid-scanned', {
+                            'rfidId': rfid_id,
+                            'text': (text or '').strip(),
+                        })
+                        await self.sio.emit('rfid-scan-status', {'scanning': False})
+                    break
+
+                await asyncio.sleep(0.1)
+        except Exception as e:
+            logger.error(f"RFID scan error: {e}")
+        finally:
+            self._rfid_scanning = False
+            if self.sio and self.sio.connected:
+                await self.sio.emit('rfid-scan-status', {'scanning': False})
+            logger.info("RFID scanning stopped")
+
+    def _rfid_read_once(self):
+        """Blocking read of one RFID tag. Called in executor thread."""
+        try:
+            uid, text = self._rfid_reader.read_no_block()
+            return uid, text
+        except Exception:
+            return None, None
 
     async def _map_build_analyse(self):
         """Analyse and send result to frontend."""
@@ -597,6 +709,8 @@ class HardwareDaemon:
         # ── Canny edge detection lane overlay stream ──
         async def handle_canny_stream(request):
             """MJPEG stream with canny lane-detection overlay for Map Builder."""
+            import cv2 as _cv2
+
             response = web.StreamResponse(
                 status=200,
                 headers={
@@ -606,30 +720,78 @@ class HardwareDaemon:
             )
             await response.prepare(request)
             boundary = b'--frame'
+
+            if not CANNY_AVAILABLE or not self._canny_detector or not self._canny_bev:
+                logger.warning("Canny stream requested but CANNY_AVAILABLE=%s, detector=%s",
+                               CANNY_AVAILABLE, self._canny_detector is not None)
+
             try:
                 while True:
                     frame_bytes = await self.camera.get_latest_frame()
-                    if frame_bytes and CANNY_AVAILABLE and self._canny_detector:
-                        try:
-                            import cv2
-                            nparr = np.frombuffer(frame_bytes, np.uint8)
-                            frame_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                            if frame_bgr is not None:
-                                h, w = frame_bgr.shape[:2]
-                                centers, lefts, rights, debug_info = self._canny_detector.detect(frame_bgr)
-                                steer, target = self._canny_detector.compute_steering(centers, w, k_gain=1.0)
-                                vis = canny_draw_debug(
-                                    frame_bgr, centers, lefts, rights, target, debug_info
-                                )
-                                # Add position overlay for map builder
-                                pos_text = f"Pos: ({self._map_x},{self._map_y}) Dir: {self._direction_name()}"
-                                steer_text = f"Steer: {steer:+.3f}" if steer is not None else "Steer: LOST"
-                                cv2.putText(vis, pos_text, (15, h - 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-                                cv2.putText(vis, steer_text, (15, h - 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-                                _, jpeg = cv2.imencode('.jpg', vis, [cv2.IMWRITE_JPEG_QUALITY, 75])
-                                frame_bytes = jpeg.tobytes()
-                        except Exception as e:
-                            logger.debug(f"Canny overlay error: {e}")
+                    if frame_bytes:
+                        if CANNY_AVAILABLE and self._canny_detector and self._canny_bev:
+                            try:
+                                nparr = np.frombuffer(frame_bytes, np.uint8)
+                                frame_bgr = _cv2.imdecode(nparr, _cv2.IMREAD_COLOR)
+                                if frame_bgr is not None:
+                                    h, w = frame_bgr.shape[:2]
+                                    # BEV-first pipeline
+                                    bev_frame = self._canny_bev.warp(frame_bgr)
+                                    centers, lefts, rights, debug_info = self._canny_detector.detect(bev_frame)
+                                    steer, target = self._canny_detector.compute_steering(
+                                        centers, w, h, k_gain=1.0)
+                                    quality = debug_info.get('lane_quality', 0.0)
+                                    frames_lost = debug_info.get('frames_lost', 0)
+
+                                    # Draw overlay on original frame (unwarp lane fill)
+                                    vis = canny_draw_overlay(
+                                        frame_bgr, self._canny_bev,
+                                        debug_info.get('extended_lefts', lefts),
+                                        debug_info.get('extended_rights', rights),
+                                        target, quality, frames_lost
+                                    )
+                                    # Add position + steer text
+                                    pos_text = f"Pos: ({self._map_x},{self._map_y}) Dir: {self._direction_name()}"
+                                    steer_text = f"Steer: {steer:+.3f}" if steer is not None else "Steer: LOST"
+                                    q_text = f"Quality: {quality:.0%} | Lost: {frames_lost}"
+                                    _cv2.putText(vis, pos_text, (15, h - 70), _cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                                    _cv2.putText(vis, steer_text, (15, h - 45), _cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                                    _cv2.putText(vis, q_text, (15, h - 20), _cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+                                    _, jpeg = _cv2.imencode('.jpg', vis, [_cv2.IMWRITE_JPEG_QUALITY, 75])
+                                    frame_bytes = jpeg.tobytes()
+                            except Exception as e:
+                                logger.warning(f"Canny overlay error: {e}", exc_info=True)
+                                # Draw error text on raw frame so the user sees what's wrong
+                                try:
+                                    nparr = np.frombuffer(frame_bytes, np.uint8)
+                                    err_frame = _cv2.imdecode(nparr, _cv2.IMREAD_COLOR)
+                                    if err_frame is not None:
+                                        h, w = err_frame.shape[:2]
+                                        _cv2.putText(err_frame, "CANNY ERROR", (15, 35),
+                                                     _cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+                                        _cv2.putText(err_frame, str(e)[:60], (15, 65),
+                                                     _cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+                                        _, jpeg = _cv2.imencode('.jpg', err_frame, [_cv2.IMWRITE_JPEG_QUALITY, 75])
+                                        frame_bytes = jpeg.tobytes()
+                                except Exception:
+                                    pass
+                        else:
+                            # Canny not available — show status overlay on raw frame
+                            try:
+                                nparr = np.frombuffer(frame_bytes, np.uint8)
+                                raw_frame = _cv2.imdecode(nparr, _cv2.IMREAD_COLOR)
+                                if raw_frame is not None:
+                                    h, w = raw_frame.shape[:2]
+                                    _cv2.putText(raw_frame, "CANNY NOT AVAILABLE", (15, 35),
+                                                 _cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                                    reason = "Module not loaded" if not CANNY_AVAILABLE else "Detector not initialized"
+                                    _cv2.putText(raw_frame, reason, (15, 60),
+                                                 _cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+                                    _, jpeg = _cv2.imencode('.jpg', raw_frame, [_cv2.IMWRITE_JPEG_QUALITY, 75])
+                                    frame_bytes = jpeg.tobytes()
+                            except Exception:
+                                pass
+
                     if frame_bytes:
                         await response.write(
                             boundary + b'\r\n'
@@ -647,17 +809,24 @@ class HardwareDaemon:
             frame_bytes = await self.camera.get_latest_frame()
             if not frame_bytes:
                 return web.Response(status=503, text='No frame')
-            if CANNY_AVAILABLE and self._canny_detector:
+            if CANNY_AVAILABLE and self._canny_detector and self._canny_bev:
                 try:
                     import cv2
                     nparr = np.frombuffer(frame_bytes, np.uint8)
                     frame_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
                     if frame_bgr is not None:
                         h, w = frame_bgr.shape[:2]
-                        centers, lefts, rights, debug_info = self._canny_detector.detect(frame_bgr)
-                        steer, target = self._canny_detector.compute_steering(centers, w, k_gain=1.0)
-                        vis = canny_draw_debug(
-                            frame_bgr, centers, lefts, rights, target, debug_info
+                        bev_frame = self._canny_bev.warp(frame_bgr)
+                        centers, lefts, rights, debug_info = self._canny_detector.detect(bev_frame)
+                        steer, target = self._canny_detector.compute_steering(
+                            centers, w, h, k_gain=1.0)
+                        quality = debug_info.get('lane_quality', 0.0)
+                        frames_lost = debug_info.get('frames_lost', 0)
+                        vis = canny_draw_overlay(
+                            frame_bgr, self._canny_bev,
+                            debug_info.get('extended_lefts', lefts),
+                            debug_info.get('extended_rights', rights),
+                            target, quality, frames_lost
                         )
                         _, jpeg = cv2.imencode('.jpg', vis, [cv2.IMWRITE_JPEG_QUALITY, 85])
                         frame_bytes = jpeg.tobytes()

@@ -2,36 +2,84 @@ import React, { useRef, useEffect, useState, useCallback } from 'react';
 
 /*
  * Map layout matching the physical track (portrait orientation):
- *   ┌─────────────────────────────────────┐
- *   │  TL ─────── B ─────── S (Start)     │  Row 0
- *   │  │   ┌─────────────┐       │        │
- *   │  │   │  Large Obs  │       │        │
- *   │  │   │      B      │       │        │
- *   │  │   └─────────────┘       │        │
- *   │  P4 ─────── P3 ─────── R1          │  Row 1
- *   │  │   ┌──────┐ ┌──────┐    │        │
- *   │  │   │      │ │  C   │    │        │
- *   │  │   └──────┘ └──────┘    │        │
- *   │  A ──────── P5 ──────── C          │  Row 2
- *   │  │   ┌──────┐ ┌──────┐    │        │
- *   │  │   │  A   │ │      │    │        │
- *   │  │   └──────┘ └──────┘    │        │
- *   │  ST ─────── P7 ─────── P6         │  Row 3
- *   └─────────────────────────────────────┘
+ *
+ *   TL ──────── B ──────── S    Row 0 (→ right)
+ *   │   ╔══════════════╗   │
+ *   │   ║  Large Rect  ║   │    (purple border)
+ *   │   ║     (B)      ║   │
+ *   │   ╚══════════════╝   │
+ *   P1 ─────────────── P2  Row 1 (← left)
+ *   │ ══════barrier══════ │
+ *   P3 ── P4 ──────── R1  Row 2 (→ right)
+ *   │  [obs]  │  [obs]  │
+ *   │         │          │
+ *   A ── P5 ──────── C    Row 3 (← left)
+ *   │ ══════barrier══════ │
+ *   P7 ─────────────── P8  Row 4 (→ right)
+ *   │  [obs]     [obs]  │
+ *   │                    │
+ *   ST ── P9 ──────── P6  Row 5 (← left)
+ *
+ *   ↑ left side  |  ↓ right side (outer clockwise loop)
  */
 
 // Obstacles (white rounded-rect areas surrounded by roads)
 const OBSTACLES = [
-    // Large top obstacle (between row 0 and row 1)
-    { x: 100, y: 95, w: 400, h: 145, label: 'B', labelX: 300, labelY: 150, hasMarker: true },
-    // Middle-left (between row 1 and row 2, left column)
-    { x: 80, y: 325, w: 180, h: 145, label: null },
-    // Middle-right (between row 1 and row 2, right column) — C marker
-    { x: 340, y: 325, w: 180, h: 145, label: 'C', labelX: 430, labelY: 380, hasMarker: true },
-    // Bottom-left (between row 2 and row 3, left column) — A marker
-    { x: 80, y: 555, w: 180, h: 145, label: 'A', labelX: 150, labelY: 610, hasMarker: true },
-    // Bottom-right (between row 2 and row 2, right column)
-    { x: 340, y: 555, w: 180, h: 145, label: null },
+    // Large top rectangle with purple border (destination B area)
+    { x: 100, y: 55, w: 400, h: 130, purpleBorder: true },
+    // Middle-left (between row 2 and row 3)
+    { x: 110, y: 335, w: 130, h: 100 },
+    // Middle-right (between row 2 and row 3)
+    { x: 360, y: 335, w: 130, h: 100 },
+    // Bottom-left (between row 4 and row 5)
+    { x: 110, y: 597, w: 130, h: 120 },
+    // Bottom-right (between row 4 and row 5)
+    { x: 360, y: 597, w: 130, h: 120 },
+];
+
+// Horizontal barrier lines (black walls with gaps at sides)
+const BARRIERS = [
+    { y: 255, xStart: 40, xEnd: 560 },
+    { y: 508, xStart: 40, xEnd: 560 },
+];
+
+// Direction arrows on roads — two-way (bidirectional) arrows
+// Each entry: [fromX, fromY, toX, toY]
+// Each road segment gets TWO arrows showing both directions
+const FLOW_ARROWS = [
+    // Top road (horizontal, two-way)
+    [140, 28, 300, 28],       // → right
+    [430, 42, 270, 42],       // ← left
+    // Below rect (horizontal, two-way)
+    [430, 203, 270, 203],     // ← left
+    [140, 217, 300, 217],     // → right
+    // Left side (vertical, two-way)
+    [43, 600, 43, 200],       // ↑ up
+    [57, 130, 57, 660],       // ↓ down
+    // Right side (vertical, two-way)
+    [543, 200, 543, 600],     // ↓ down
+    [557, 660, 557, 130],     // ↑ up
+    // Upper corridor (horizontal, two-way)
+    [140, 293, 300, 293],     // → right
+    [430, 307, 270, 307],     // ← left
+    // Center vertical (two-way)
+    [293, 340, 293, 430],     // ↓ down
+    [307, 430, 307, 340],     // ↑ up
+    // Lower corridor (horizontal, two-way)
+    [430, 463, 270, 463],     // ← left
+    [140, 477, 300, 477],     // → right
+    // Below barrier (horizontal, two-way)
+    [140, 538, 300, 538],     // → right
+    [430, 552, 270, 552],     // ← left
+    // Bottom road (horizontal, two-way)
+    [430, 763, 270, 763],     // ← left
+    [140, 777, 300, 777],     // → right
+    // Left bottom vertical (two-way)
+    [43, 720, 43, 500],       // ↑ up
+    [57, 500, 57, 720],       // ↓ down
+    // Right bottom vertical (two-way)
+    [543, 500, 543, 720],     // ↓ down
+    [557, 720, 557, 500],     // ↑ up
 ];
 
 const POINT_COLORS = {
@@ -58,35 +106,6 @@ function DemoMap({ points, vehiclePosition, activePath, livePos }) {
         ctx.fillStyle = '#9e9e9e';
         ctx.fillRect(0, 0, W, H);
 
-        // ── White road lane markings (dashed lines) ──
-        ctx.strokeStyle = 'rgba(255,255,255,0.55)';
-        ctx.lineWidth = 2;
-        ctx.setLineDash([12, 10]);
-
-        // Horizontal lane center lines
-        const hRows = [50, 280, 510, 740];
-        hRows.forEach(y => {
-            ctx.beginPath(); ctx.moveTo(20, y); ctx.lineTo(W - 20, y); ctx.stroke();
-        });
-
-        // Vertical lane center lines
-        const vCols = [50, 300, 550];
-        vCols.forEach(x => {
-            // left column: full height
-            if (x === 50) {
-                ctx.beginPath(); ctx.moveTo(x, 20); ctx.lineTo(x, H - 20); ctx.stroke();
-            }
-            // center column: only below row 1 (large obstacle blocks top section)
-            else if (x === 300) {
-                ctx.beginPath(); ctx.moveTo(x, 280); ctx.lineTo(x, H - 20); ctx.stroke();
-            }
-            // right column: full height
-            else {
-                ctx.beginPath(); ctx.moveTo(x, 20); ctx.lineTo(x, H - 20); ctx.stroke();
-            }
-        });
-        ctx.setLineDash([]);
-
         // ── Obstacles (white rounded rectangles) ──
         OBSTACLES.forEach(obs => {
             // Shadow
@@ -99,23 +118,54 @@ function DemoMap({ points, vehiclePosition, activePath, livePos }) {
             ctx.beginPath();
             ctx.roundRect(obs.x, obs.y, obs.w, obs.h, 18);
             ctx.fill();
-
-            // Destination marker (green square with label)
-            if (obs.hasMarker && obs.label) {
-                const mw = 40, mh = 28;
-                const mx = obs.labelX - mw / 2;
-                const my = obs.labelY - mh / 2;
-                ctx.fillStyle = '#34A853';
+            // Purple border for top rectangle
+            if (obs.purpleBorder) {
+                ctx.strokeStyle = '#7c3aed';
+                ctx.lineWidth = 3;
                 ctx.beginPath();
-                ctx.roundRect(mx, my, mw, mh, 5);
-                ctx.fill();
-                ctx.fillStyle = '#fff';
-                ctx.font = 'bold 14px "Segoe UI", sans-serif';
-                ctx.textAlign = 'center';
-                ctx.textBaseline = 'middle';
-                ctx.fillText(obs.label, obs.labelX, obs.labelY);
-                ctx.textBaseline = 'alphabetic';
+                ctx.roundRect(obs.x, obs.y, obs.w, obs.h, 18);
+                ctx.stroke();
             }
+        });
+
+        // ── Barrier lines (thick black horizontal lines) ──
+        BARRIERS.forEach(bar => {
+            ctx.strokeStyle = '#333';
+            ctx.lineWidth = 5;
+            ctx.lineCap = 'round';
+            ctx.beginPath();
+            ctx.moveTo(bar.xStart, bar.y);
+            ctx.lineTo(bar.xEnd, bar.y);
+            ctx.stroke();
+        });
+
+        // ── Direction arrows on roads ──
+        FLOW_ARROWS.forEach(([fx, fy, tx, ty]) => {
+            const mx = (fx + tx) / 2;
+            const my = (fy + ty) / 2;
+            const angle = Math.atan2(ty - fy, tx - fx);
+            const headLen = 12;
+
+            ctx.save();
+            ctx.translate(mx, my);
+            ctx.rotate(angle);
+            // Arrow shaft
+            const shaftLen = 20;
+            ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.moveTo(-shaftLen, 0);
+            ctx.lineTo(shaftLen, 0);
+            ctx.stroke();
+            // Arrow head
+            ctx.fillStyle = 'rgba(255,255,255,0.5)';
+            ctx.beginPath();
+            ctx.moveTo(headLen + 6, 0);
+            ctx.lineTo(-headLen / 2 + 6, -headLen / 2);
+            ctx.lineTo(-headLen / 2 + 6, headLen / 2);
+            ctx.closePath();
+            ctx.fill();
+            ctx.restore();
         });
 
         if (!points || points.length === 0) {

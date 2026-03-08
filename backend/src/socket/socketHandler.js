@@ -150,6 +150,27 @@ function setupSocket(io) {
             io.to('admin').emit('map-build-status', data);
         });
 
+        // ====== RFID Events ======
+        // Frontend → Hardware: start RFID scan
+        socket.on('rfid-start-scan', () => {
+            io.to('hardware').emit('rfid-start-scan');
+        });
+
+        // Frontend → Hardware: stop RFID scan
+        socket.on('rfid-stop-scan', () => {
+            io.to('hardware').emit('rfid-stop-scan');
+        });
+
+        // Hardware → Frontend: RFID tag scanned
+        socket.on('rfid-scanned', (data) => {
+            io.to('admin').emit('rfid-scanned', data);
+        });
+
+        // Hardware → Frontend: RFID scan status (scanning/stopped)
+        socket.on('rfid-scan-status', (data) => {
+            io.to('admin').emit('rfid-scan-status', data);
+        });
+
         socket.on('disconnect', () => {
             console.log(`Client disconnected: ${socket.id}`);
         });

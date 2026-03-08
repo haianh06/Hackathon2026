@@ -76,32 +76,41 @@ class MapService {
     }
 
     // Seed demo map data matching the physical track layout
-    // Grid: 3 columns × 4 rows of intersections
-    // Start (top-right), Stop (bottom-left), Destinations: A, B, C
-    // Large obstacle at top blocks center vertical between row 0 and row 1
+    // Grid: 3 columns × 6 rows of intersections
+    // Outer clockwise loop: → top, ↓ right, ← bottom, ↑ left
+    // Inner corridor with center vertical paths
+    // Large obstacle at top (destination B), 4 smaller obstacles
     async seedDemoMap() {
         await MapPoint.deleteMany({});
 
         const demoPoints = [
-            // Row 0 (top) — horizontal road across top
-            { pointId: 'S', x: 550, y: 50, label: 'Start (Xuất phát)', type: 'start', connections: ['B', 'R1'] },
-            { pointId: 'B', x: 300, y: 50, label: 'Điểm B', type: 'destination', connections: ['S', 'TL'] },
-            { pointId: 'TL', x: 50, y: 50, label: 'Góc trên trái', type: 'waypoint', connections: ['B', 'P4'] },
+            // Row 0 (top) — horizontal road across top (→ right)
+            { pointId: 'TL', x: 50, y: 35, label: 'Góc trên trái', type: 'waypoint', connections: ['B', 'P1'] },
+            { pointId: 'B', x: 300, y: 35, label: 'Điểm B', type: 'destination', connections: ['TL', 'S'] },
+            { pointId: 'S', x: 550, y: 35, label: 'Start (Xuất phát)', type: 'start', connections: ['B', 'P2'] },
 
-            // Row 1 (upper-mid) — horizontal road below the large obstacle
-            { pointId: 'R1', x: 550, y: 280, label: 'Ngã tư phải trên', type: 'intersection', connections: ['S', 'P3', 'C'] },
-            { pointId: 'P3', x: 300, y: 280, label: 'Ngã tư trung tâm', type: 'intersection', connections: ['R1', 'P4', 'P5'] },
-            { pointId: 'P4', x: 50, y: 280, label: 'Ngã tư trái trên', type: 'intersection', connections: ['TL', 'P3', 'A'] },
+            // Row 1 (below rectangle) — horizontal road (← left)
+            { pointId: 'P1', x: 50, y: 210, label: 'Dưới rect trái', type: 'waypoint', connections: ['TL', 'P2', 'P3'] },
+            { pointId: 'P2', x: 550, y: 210, label: 'Dưới rect phải', type: 'waypoint', connections: ['S', 'P1', 'R1'] },
 
-            // Row 2 (lower-mid) — horizontal road below the medium obstacles
-            { pointId: 'C', x: 550, y: 510, label: 'Điểm C', type: 'destination', connections: ['R1', 'P5', 'P6'] },
-            { pointId: 'P5', x: 300, y: 510, label: 'Ngã tư trung tâm dưới', type: 'intersection', connections: ['P3', 'C', 'A', 'P7'] },
-            { pointId: 'A', x: 50, y: 510, label: 'Điểm A', type: 'destination', connections: ['P4', 'P5', 'ST'] },
+            // Row 2 (upper corridor) — horizontal road (→ right)
+            { pointId: 'P3', x: 50, y: 300, label: 'Ngã tư trái trên', type: 'intersection', connections: ['P1', 'P4', 'A'] },
+            { pointId: 'P4', x: 300, y: 300, label: 'Ngã tư trung tâm', type: 'intersection', connections: ['P3', 'R1', 'P5'] },
+            { pointId: 'R1', x: 550, y: 300, label: 'Ngã tư phải trên', type: 'intersection', connections: ['P2', 'P4', 'C'] },
 
-            // Row 3 (bottom) — horizontal road at bottom
-            { pointId: 'P6', x: 550, y: 740, label: 'Góc dưới phải', type: 'waypoint', connections: ['C', 'P7'] },
-            { pointId: 'P7', x: 300, y: 740, label: 'Dưới trung tâm', type: 'waypoint', connections: ['P5', 'P6', 'ST'] },
-            { pointId: 'ST', x: 50, y: 740, label: 'Stop (Kết thúc)', type: 'stop', connections: ['A', 'P7'] },
+            // Row 3 (lower corridor) — horizontal road (← left)
+            { pointId: 'A', x: 50, y: 470, label: 'Điểm A', type: 'destination', connections: ['P3', 'P5', 'P7'] },
+            { pointId: 'P5', x: 300, y: 470, label: 'Ngã tư trung tâm dưới', type: 'intersection', connections: ['P4', 'A', 'C'] },
+            { pointId: 'C', x: 550, y: 470, label: 'Điểm C', type: 'destination', connections: ['R1', 'P5', 'P8'] },
+
+            // Row 4 (below lower barrier) — horizontal road (→ right)
+            { pointId: 'P7', x: 50, y: 545, label: 'Dưới barrier trái', type: 'waypoint', connections: ['A', 'P8', 'ST'] },
+            { pointId: 'P8', x: 550, y: 545, label: 'Dưới barrier phải', type: 'waypoint', connections: ['C', 'P7', 'P6'] },
+
+            // Row 5 (bottom) — horizontal road (← left)
+            { pointId: 'ST', x: 50, y: 770, label: 'Stop (Kết thúc)', type: 'stop', connections: ['P7', 'P9'] },
+            { pointId: 'P9', x: 300, y: 770, label: 'Dưới trung tâm', type: 'waypoint', connections: ['ST', 'P6'] },
+            { pointId: 'P6', x: 550, y: 770, label: 'Góc dưới phải', type: 'waypoint', connections: ['P8', 'P9'] },
         ];
 
         await MapPoint.insertMany(demoPoints);
