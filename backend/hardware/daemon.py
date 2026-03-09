@@ -46,12 +46,12 @@ except ImportError as e:
 # Import canny edge detection
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'canny-edge-detection-main'))
 try:
-    from lane_dynamic_center import DynamicLaneTracker
+    from test_1_improved import UltimateDynamicTracker
     CANNY_AVAILABLE = True
-    logger.info("Dynamic lane tracker loaded successfully")
+    logger.info("UltimateDynamicTracker loaded successfully")
 except ImportError as e:
     CANNY_AVAILABLE = False
-    logger.warning(f"Dynamic lane tracker not available: {e}")
+    logger.warning(f"UltimateDynamicTracker not available: {e}")
 
 # Socket.IO client
 try:
@@ -95,7 +95,7 @@ class HardwareDaemon:
         self._map_y = 0  # grid coordinate y
         self._map_direction = 0  # 0=up(+y), 1=right(+x), 2=down(-y), 3=left(-x)
         self._map_step_count = 0
-        self._lane_tracker = DynamicLaneTracker(width=640, height=480) if CANNY_AVAILABLE else None
+        self._lane_tracker = UltimateDynamicTracker(width=640, height=480) if CANNY_AVAILABLE else None
 
         # ── RFID scanner state ──
         self._rfid_scanning = False
@@ -329,10 +329,9 @@ class HardwareDaemon:
                         nparr = np.frombuffer(frame_bytes, np.uint8)
                         frame_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
                         if frame_bgr is not None:
-                            steer_val, quality, debug, _ = self._lane_tracker.detect_and_steer(frame_bgr)
-                            centers_count = debug.get('real_count', 0)
-
-                            if quality >= QUALITY_MIN and centers_count >= 2:
+                            steer_val, _, _ = self._lane_tracker.process_frame(frame_bgr)
+                            # steer_val đã qua PD + EMA bên trong tracker
+                            if abs(steer_val) > 0.001 or True:
                                 canny_steer = steer_val
                                 frames_ok += 1
                     except Exception as e:
@@ -452,7 +451,7 @@ class HardwareDaemon:
             self.motor.stop()
 
     async def _do_canny_analysis(self):
-        """Run dynamic lane detection on current frame."""
+        """Run UltimateDynamicTracker on current frame."""
         if not CANNY_AVAILABLE or self._lane_tracker is None:
             return None
 
@@ -468,22 +467,18 @@ class HardwareDaemon:
                 return None
 
             h, w = frame.shape[:2]
-            steer, quality, debug, _ = self._lane_tracker.detect_and_steer(frame)
-
-            midpoint = None
-            if 'mid_bot' in debug:
-                midpoint = {'x': float(debug['mid_bot']), 'y': float(self._lane_tracker.y_bottom)}
+            steer, viz_frame, bev_vis = self._lane_tracker.process_frame(frame)
 
             return {
                 'steering': float(steer),
-                'laneQuality': float(quality),
-                'centersCount': debug.get('real_count', 0),
+                'laneQuality': 1.0 if abs(steer) > 0.001 else 0.0,
+                'centersCount': 0,
                 'leftsCount': 0,
                 'rightsCount': 0,
-                'midpoint': midpoint,
+                'midpoint': None,
                 'frameWidth': w,
                 'frameHeight': h,
-                'framesLost': debug.get('frames_lost', 0),
+                'framesLost': 0,
                 'virtualLeft': False,
                 'virtualRight': False,
             }
@@ -708,16 +703,11 @@ class HardwareDaemon:
                                 frame_bgr = _cv2.imdecode(nparr, _cv2.IMREAD_COLOR)
                                 if frame_bgr is not None:
                                     h, w = frame_bgr.shape[:2]
-                                    steer, quality, debug_info, vis = self._lane_tracker.detect_and_steer(frame_bgr)
-                                    frames_lost = debug_info.get('frames_lost', 0)
+                                    steer, vis, bev_vis = self._lane_tracker.process_frame(frame_bgr)
 
-                                    # Add position + steer text
+                                    # Add position text on viz
                                     pos_text = f"Pos: ({self._map_x},{self._map_y}) Dir: {self._direction_name()}"
-                                    steer_text = f"Steer: {steer:+.3f}"
-                                    q_text = f"Quality: {quality:.0%} | Lost: {frames_lost}"
-                                    _cv2.putText(vis, pos_text, (15, h - 70), _cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-                                    _cv2.putText(vis, steer_text, (15, h - 45), _cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-                                    _cv2.putText(vis, q_text, (15, h - 20), _cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+                                    _cv2.putText(vis, pos_text, (15, h - 30), _cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
                                     _, jpeg = _cv2.imencode('.jpg', vis, [_cv2.IMWRITE_JPEG_QUALITY, 75])
                                     frame_bytes = jpeg.tobytes()
                             except Exception as e:
@@ -776,7 +766,7 @@ class HardwareDaemon:
                     nparr = np.frombuffer(frame_bytes, np.uint8)
                     frame_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
                     if frame_bgr is not None:
-                        _, _, _, vis = self._lane_tracker.detect_and_steer(frame_bgr)
+                        _, vis, _ = self._lane_tracker.process_frame(frame_bgr)
                         _, jpeg = cv2.imencode('.jpg', vis, [cv2.IMWRITE_JPEG_QUALITY, 85])
                         frame_bytes = jpeg.tobytes()
                 except Exception as e:

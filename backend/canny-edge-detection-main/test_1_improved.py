@@ -1,407 +1,192 @@
 import cv2
 import numpy as np
-import warnings
 from collections import deque
-import time
-from typing import Optional, Tuple, List, Dict
+from typing import Tuple, Optional
 
-# =========================
-# Utility: Exponential Moving Average
-# =========================
-class EMA:
-    """Exponential Moving Average for smoothing noisy sensor data."""
-    def __init__(self, alpha: float = 0.35, init: Optional[float] = None):
-        self.alpha = float(np.clip(alpha, 0.0, 1.0))
-        self.v = init
+class EMAFilter:
+    def __init__(self, alpha: float = 0.4):
+        self.alpha = alpha
+        self.value = None
 
-    def update(self, x: Optional[float]) -> Optional[float]:
-        if x is None:
-            return self.v
-        if self.v is None:
-            self.v = x
+    def update(self, new_value: Optional[float]) -> float:
+        if new_value is None:
+            return self.value if self.value is not None else 0.0
+        if self.value is None:
+            self.value = new_value
         else:
-            self.v = self.alpha * x + (1.0 - self.alpha) * self.v
-        return self.v
-    
-    def reset(self) -> None:
-        self.v = None
+            self.value = (self.alpha * new_value) + ((1.0 - self.alpha) * self.value)
+        return float(self.value)
 
-
-# =========================
-# Utility: Perspective Transform (Bird's-Eye View)
-# =========================
-class BirdEyeView:
-    """Handles perspective warp and unwarp operations."""
-    def __init__(self, w: int, h: int):
-        self.w = w
-        self.h = h
+class UltimateDynamicTracker:
+    def __init__(self, width: int = 640, height: int = 480):
+        self.w = width
+        self.h = height
         
-        # Tọa độ hình thang trên ảnh gốc (Bạn cần tinh chỉnh theo góc cam thực tế của xe)
-        # Thông số này đang thiết lập cho ảnh 640x480, camera đặt giữa xe
-        self.src_pts = np.float32([
-            [int(w * 0.15), h],                 # Bottom-left
-            [int(w * 0.85), h],                 # Bottom-right
-            [int(w * 0.40), int(h * 0.60)],     # Top-left
-            [int(w * 0.60), int(h * 0.60)]      # Top-right
-        ])
+        self.y_bottom = int(self.h * 0.90)  # Đẩy lên một chút để tránh dính mũi xe/bóng râm
+        self.y_top = int(self.h * 0.55)
         
-        # Tọa độ hình chữ nhật trên ảnh Bird's-Eye View
-        self.offset = int(w * 0.25)
-        self.dst_pts = np.float32([
-            [self.offset, h],                   # Bottom-left
-            [w - self.offset, h],               # Bottom-right
-            [self.offset, 0],                   # Top-left
-            [w - self.offset, 0]                # Top-right
-        ])
-        
-        # Tính toán ma trận biến đổi
-        self.M = cv2.getPerspectiveTransform(self.src_pts, self.dst_pts)
-        self.Minv = cv2.getPerspectiveTransform(self.dst_pts, self.src_pts)
-
-    def warp(self, img: np.ndarray) -> np.ndarray:
-        return cv2.warpPerspective(img, self.M, (self.w, self.h), flags=cv2.INTER_LINEAR)
-
-    def unwarp(self, img: np.ndarray) -> np.ndarray:
-        return cv2.warpPerspective(img, self.Minv, (self.w, self.h), flags=cv2.INTER_LINEAR)
-
-
-# =========================
-# Lane Detector with Virtual Markers & BEV
-# =========================
-class PointsOfOrientationLane:
-    def __init__(
-        self,
-        n_heights: int = 15,           # Tăng số điểm quét trên BEV
-        search_margin_px: int = 150,   # Margin nhỏ lại vì vạch trong BEV song song
-        min_lane_width_px: int = 100,  # Độ rộng vạch đường trong BEV lớn hơn
-        ema_center_alpha: float = 0.35,
-        max_frames_lost: int = 30,
-        use_virtual_markers: bool = True
-    ):
-        self.n_heights = n_heights
-        self.search_margin_px = search_margin_px
-        self.min_lane_width_px = min_lane_width_px
-        self.max_frames_lost = max_frames_lost
-        self.use_virtual_markers = use_virtual_markers
-        
-        self.center_ema = EMA(alpha=ema_center_alpha, init=None)
-        self.last_good_center = None
-        self.frames_lost = 0
-        
-        self.last_left_poly = None
-        self.last_right_poly = None
+        self.default_lane_width = int(self.w * 0.6)
         self.lane_width_history = deque(maxlen=30)
+        
+        # Hình thang dự phòng chuẩn xác
+        self.prev_src_pts = np.float32([
+            [int(self.w * 0.1), self.y_bottom], [int(self.w * 0.9), self.y_bottom],
+            [int(self.w * 0.3), self.y_top], [int(self.w * 0.7), self.y_top]
+        ])
 
-    def _binary_edges(self, bev_bgr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Tối ưu hóa: Auto-Canny + CLAHE + HLS trên ảnh Bird's-Eye View"""
-        # 1. Tiền xử lý ánh sáng bằng CLAHE
-        lab = cv2.cvtColor(bev_bgr, cv2.COLOR_BGR2LAB)
-        l_channel, a, b_channel = cv2.split(lab)
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-        cl = clahe.apply(l_channel)
-        limg = cv2.merge((cl, a, b_channel))
-        bgr_enhanced = cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
+        self.Kp = 0.85
+        self.Kd = 0.60
+        self.steer_ema = EMAFilter(alpha=0.3)
 
-        # 2. Không gian màu HLS — ngưỡng trắng hạ xuống để bắt vạch trên sàn
-        hls = cv2.cvtColor(bgr_enhanced, cv2.COLOR_BGR2HLS)
-        white = cv2.inRange(hls, (0, 140, 0), (180, 255, 80))
-        yellow = cv2.inRange(hls, (15, 30, 115), (35, 204, 255))
-        color_mask = cv2.bitwise_or(white, yellow)
-
-        # 2b. Grayscale adaptive threshold fallback — bắt vạch trắng trên nền tối
-        gray = cv2.cvtColor(bgr_enhanced, cv2.COLOR_BGR2GRAY)
+    # ==========================================
+    # CẢI TIẾN 1: TÁCH NỀN SIÊU SẠCH CHO THẢM XÁM / VẠCH TRẮNG
+    # ==========================================
+    def _get_clean_mask(self, bgr_img: np.ndarray) -> np.ndarray:
+        """Chỉ tập trung bắt màu sáng/trắng, loại bỏ nhiễu Canny rối rắm"""
+        gray = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2GRAY)
         blur = cv2.GaussianBlur(gray, (5, 5), 0)
-        _, bright_mask = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        color_mask = cv2.bitwise_or(color_mask, bright_mask)
-
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-        color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_CLOSE, kernel)
-
-        # 3. AUTO-CANNY
-        v = np.median(blur)
-        sigma = 0.33
-        lower_canny = int(max(0, (1.0 - sigma) * v))
-        upper_canny = int(min(255, (1.0 + sigma) * v))
-        edges = cv2.Canny(blur, lower_canny, upper_canny)
-
-        # 4. FUSION
-        dilated_color = cv2.dilate(color_mask, kernel, iterations=1)
-        final_edges = cv2.bitwise_and(edges, dilated_color)
-
-        return final_edges, color_mask
-
-    @staticmethod
-    def _find_edge_x_in_row(row: np.ndarray, x_ref: float, direction: int, left_bound: int, right_bound: int) -> Optional[int]:
-        w = row.shape[0]
-        if direction < 0:
-            xs = range(int(x_ref), left_bound - 1, -1)
-        else:
-            xs = range(int(x_ref), right_bound + 1, 1)
-
-        for x in xs:
-            if 0 <= x < w and row[x] != 0:
-                return x
-        return None
-
-    def _fit_lane_poly(self, points: List[Tuple[float, float]]) -> Optional[np.ndarray]:
-        if len(points) < 3: return None
-        xs = np.array([p[0] for p in points], dtype=np.float64)
-        ys = np.array([p[1] for p in points], dtype=np.float64)
-        unique_ys = len(np.unique(ys))
-        if unique_ys < 2: return None
-        try:
-            with warnings.catch_warnings():
-                warnings.simplefilter('ignore')
-                deg = 2 if unique_ys >= 3 else 1
-                return np.polyfit(ys, xs, deg)
-        except (np.linalg.LinAlgError, ValueError):
-            return None
-
-    def _extrapolate_lane(self, lefts: List[Tuple[float, float]], rights: List[Tuple[float, float]], frame_h: int) -> Tuple[List, List, Dict]:
-        virtual_info = {"used_virtual_left": False, "used_virtual_right": False}
-        extended_lefts = list(lefts)
-        extended_rights = list(rights)
         
-        left_poly = self._fit_lane_poly(lefts)
-        right_poly = self._fit_lane_poly(rights)
+        # Lọc nhị phân: Chỉ giữ lại các pixel cực sáng (vạch trắng). 
+        # LƯU Ý: Nếu phòng tối, hãy giảm số 180 xuống (VD: 150). Nếu phòng sáng chói, tăng lên 200.
+        _, mask = cv2.threshold(blur, 180, 255, cv2.THRESH_BINARY)
         
-        if left_poly is None and self.last_left_poly is not None: left_poly = self.last_left_poly
-        if right_poly is None and self.last_right_poly is not None: right_poly = self.last_right_poly
+        # Xóa các đốm nhiễu nhỏ
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
         
-        if self.use_virtual_markers:
-            ys = np.linspace(0, frame_h - 1, self.n_heights).astype(int)
+        return mask
+
+    # ==========================================
+    # CẢI TIẾN 2: THUẬT TOÁN QUÉT TIA (RAYCAST) CHỐNG CHÉO HÌNH THANG
+    # ==========================================
+    def _scan_outwards(self, row_mask: np.ndarray, start_x: int) -> Tuple[Optional[int], Optional[int]]:
+        """Bắn tia từ giữa xe sang 2 bên để tìm mép trong của vạch trắng"""
+        row_1d = row_mask  # Lấy mảng 1D pixel trắng/đen
+        
+        l_pt = None
+        r_pt = None
+        
+        # 1. Quét từ tâm sang TRÁI
+        for x in range(start_x, 0, -1):
+            if row_1d[x] > 0:  # Chạm pixel trắng đầu tiên
+                l_pt = x
+                break
+                
+        # 2. Quét từ tâm sang PHẢI
+        for x in range(start_x, self.w - 1):
+            if row_1d[x] > 0:  # Chạm pixel trắng đầu tiên
+                r_pt = x
+                break
+                
+        return l_pt, r_pt
+
+    def process_frame(self, frame: np.ndarray):
+        mask = self._get_clean_mask(frame)
+        viz_frame = frame.copy()
+        
+        # Hiển thị mask nhỏ ở góc màn hình để bạn dễ debug độ sáng
+        mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+        mask_small = cv2.resize(mask_bgr, (160, 120))
+        viz_frame[0:120, 0:160] = mask_small
+        cv2.putText(viz_frame, "Binary Mask", (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+
+        car_center_x = self.w // 2
+
+        # Lấy 2 dòng pixel (quét ngang) tại y_bottom và y_top
+        row_bot = mask[self.y_bottom, :]
+        row_top = mask[self.y_top, :]
+
+        # Dùng thuật toán tia quét để tìm điểm neo
+        l_bot, r_bot = self._scan_outwards(row_bot, car_center_x)
+        l_top, r_top = self._scan_outwards(row_top, car_center_x)
+
+        # Logic nội suy độ rộng làn đường
+        valid_widths = []
+        if l_bot is not None and r_bot is not None: valid_widths.append(r_bot - l_bot)
+        if l_top is not None and r_top is not None: valid_widths.append(r_top - l_top)
+        
+        if valid_widths:
+            self.lane_width_history.append(np.mean(valid_widths))
+        current_w = int(np.mean(self.lane_width_history)) if self.lane_width_history else self.default_lane_width
+
+        if l_bot is None and r_bot is not None: l_bot = max(0, r_bot - current_w)
+        if r_bot is None and l_bot is not None: r_bot = min(self.w, l_bot + current_w)
+        if l_top is None and r_top is not None: l_top = max(0, r_top - current_w)
+        if r_top is None and l_top is not None: r_top = min(self.w, l_top + current_w)
+
+        steer_final = 0.0
+        bev_vis = np.zeros((self.h, self.w, 3), dtype=np.uint8)
+
+        # ĐIỀU KIỆN CHẶT CHẼ: Hình thang không được phép chéo nhau (l_bot phải < r_bot)
+        if (l_bot is not None and r_bot is not None and l_top is not None and r_top is not None 
+            and l_bot < r_bot and l_top < r_top):
             
-            if left_poly is None and right_poly is not None and len(self.lane_width_history) > 0:
-                avg_width = np.median(self.lane_width_history)
-                virtual_info["used_virtual_left"] = True
-                for y in ys:
-                    x_right = right_poly[0]*y*y + right_poly[1]*y + right_poly[2]
-                    extended_lefts.append((x_right - avg_width, int(y)))
-                left_poly = self._fit_lane_poly(extended_lefts)
+            mid_bot_x = int((l_bot + r_bot) / 2)
+            mid_top_x = int((l_top + r_top) / 2)
+            point_of_orientation = (mid_top_x, self.y_top)
+
+            # Cập nhật bộ nhớ dự phòng
+            self.prev_src_pts = np.float32([
+                [l_bot, self.y_bottom], [r_bot, self.y_bottom],
+                [l_top, self.y_top], [r_top, self.y_top]
+            ])
+
+            # Vẽ Hình thang động ôm khít mép trong vạch kẻ
+            trap_pts = np.array([[l_bot, self.y_bottom], [l_top, self.y_top], 
+                                 [r_top, self.y_top], [r_bot, self.y_bottom]], np.int32)
+            cv2.polylines(viz_frame, [trap_pts], True, (0, 165, 255), 3)
             
-            if right_poly is None and left_poly is not None and len(self.lane_width_history) > 0:
-                avg_width = np.median(self.lane_width_history)
-                virtual_info["used_virtual_right"] = True
-                for y in ys:
-                    x_left = left_poly[0]*y*y + left_poly[1]*y + left_poly[2]
-                    extended_rights.append((x_left + avg_width, int(y)))
-                right_poly = self._fit_lane_poly(extended_rights)
-        
-        if left_poly is not None: self.last_left_poly = left_poly
-        if right_poly is not None: self.last_right_poly = right_poly
-        
-        return extended_lefts, extended_rights, virtual_info
+            # Vẽ đường Line Center và Point of Orientation
+            cv2.line(viz_frame, (mid_bot_x, self.y_bottom), point_of_orientation, (0, 255, 255), 3)
+            cv2.circle(viz_frame, point_of_orientation, 8, (0, 0, 255), -1)
+            cv2.putText(viz_frame, "Point of Orientation", (mid_top_x + 15, self.y_top), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
-    def detect(self, bev_frame: np.ndarray) -> Tuple[List, List, List, Dict]:
-        h, w = bev_frame.shape[:2]
-        edges, masked = self._binary_edges(bev_frame)
+            # PD Controller
+            e_offset = (mid_bot_x - car_center_x) / (self.w / 2.0)
+            e_heading = (mid_top_x - mid_bot_x) / (self.w / 2.0)
+            raw_steer = np.clip((self.Kp * e_offset) + (self.Kd * e_heading), -1.0, 1.0)
+            steer_final = self.steer_ema.update(raw_steer)
 
-        # Quét từ dưới lên trên trong ảnh BEV
-        ys = np.linspace(h - 1, 0, self.n_heights).astype(int)
-        x_center_ref = self.last_good_center if self.last_good_center is not None else (w / 2)
-        
-        centers, lefts, rights = [], [], []
-
-        # Biến đếm vạch thật để truncation logic
-        real_left_count = 0
-        real_right_count = 0
-
-        for y in ys:
-            row = edges[y, :]
-            left_bound = max(0, int(x_center_ref - self.search_margin_px))
-            right_bound = min(w - 1, int(x_center_ref + self.search_margin_px))
-
-            xL = self._find_edge_x_in_row(row, x_center_ref, -1, left_bound, right_bound)
-            xR = self._find_edge_x_in_row(row, x_center_ref, +1, left_bound, right_bound)
-
-            # --- TRUNCATION: dừng quét khi 1 vạch biến mất mà vạch kia vẫn còn ---
-            if (xL is not None) and (xR is None) and (real_right_count > 2):
-                break  # Vạch phải đã đứt, ngừng quét lên cao
-            if (xR is not None) and (xL is None) and (real_left_count > 2):
-                break  # Vạch trái đã đứt, ngừng quét lên cao
-
-            if xL is None or xR is None: continue
-            if (xR - xL) < self.min_lane_width_px: continue
-
-            real_left_count += 1
-            real_right_count += 1
-
-            xC = 0.5 * (xL + xR)
-            self.lane_width_history.append(xR - xL)
-            lefts.append((xL, y))
-            rights.append((xR, y))
-            centers.append((xC, y))
-            x_center_ref = xC  # Cập nhật center cho window tiếp theo
-
-        extended_lefts, extended_rights, virtual_info = self._extrapolate_lane(lefts, rights, h)
-
-        if len(extended_lefts) > 0 and len(extended_rights) > 0:
-            centers.clear()
-            for l, r in zip(extended_lefts, extended_rights):
-                centers.append(((l[0] + r[0]) / 2, (l[1] + r[1]) / 2))
-
-        if len(centers) > 0:
-            # Lấy điểm đáy (gần xe nhất) làm reference cho frame sau
-            x_bottom = max(centers, key=lambda p: p[1])[0]
-            self.last_good_center = self.center_ema.update(x_bottom)
-            self.frames_lost = 0
-            lane_quality = len(lefts) / self.n_heights if len(lefts) > 0 else 0.5
+            # BEV
+            dst_bev = np.float32([[int(self.w * 0.25), self.h], [int(self.w * 0.75), self.h], 
+                                  [int(self.w * 0.25), 0], [int(self.w * 0.75), 0]])
+            matrix_bev = cv2.getPerspectiveTransform(self.prev_src_pts, dst_bev)
+            bev_vis = cv2.warpPerspective(frame, matrix_bev, (self.w, self.h))
+            
+            mask_bev = cv2.warpPerspective(mask, matrix_bev, (self.w, self.h))
+            mask_bev_bgr = cv2.cvtColor(mask_bev, cv2.COLOR_GRAY2BGR)
+            bev_vis = cv2.addWeighted(bev_vis, 0.7, mask_bev_bgr, 1.0, 0)
+            
+            cv2.line(bev_vis, (self.w//2, self.h), (self.w//2, 0), (0, 255, 0), 2, cv2.LINE_DASH)
+            
         else:
-            self.center_ema.update(None)
-            self.frames_lost += 1
-            lane_quality = 0.0
-            if self.frames_lost > self.max_frames_lost:
-                self.last_good_center = None
-                self.center_ema.reset()
+            # Nếu vi phạm điều kiện (ví dụ 2 vạch chéo nhau), sử dụng bộ nhớ cũ!
+            steer_final = self.steer_ema.update(None)
+            cv2.putText(viz_frame, "FALLBACK: KEEPING PREVIOUS SHAPE", (180, 80), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            
+            # Vẽ lại hình thang cũ mờ hơn để báo hiệu
+            trap_pts = np.array([[self.prev_src_pts[0][0], self.prev_src_pts[0][1]], 
+                                 [self.prev_src_pts[2][0], self.prev_src_pts[2][1]], 
+                                 [self.prev_src_pts[3][0], self.prev_src_pts[3][1]], 
+                                 [self.prev_src_pts[1][0], self.prev_src_pts[1][1]]], np.int32)
+            cv2.polylines(viz_frame, [trap_pts], True, (0, 0, 255), 2)
 
-        debug = {
-            "edges": edges, "masked": masked,
-            "lane_quality": lane_quality, "frames_lost": self.frames_lost,
-            "virtual_markers": virtual_info,
-            "extended_lefts": extended_lefts, "extended_rights": extended_rights
-        }
-        return centers, extended_lefts, extended_rights, debug
+        cv2.putText(viz_frame, f"STEER: {steer_final:+.3f}", (180, 40), cv2.FONT_HERSHEY_DUPLEX, 1, (255, 255, 255), 2)
+        return steer_final, viz_frame, bev_vis
 
-    def compute_steering(self, centers: List[Tuple[float, float]], frame_w: int, frame_h: int, k_gain: float = 1.15, lookahead_y_frac: float = 0.60) -> Tuple[Optional[float], Optional[Tuple[float, float]]]:
-        if len(centers) < 2: return None, None
-        xs = np.array([p[0] for p in centers], dtype=np.float64)
-        ys = np.array([p[1] for p in centers], dtype=np.float64)
-
-        # --- DYNAMIC LOOK-AHEAD: nhìn gần hơn khi đường ngắn (gần ngã rẽ) ---
-        if len(centers) < (self.n_heights * 0.5):
-            lookahead_y_frac = 0.85  # rất gần mũi xe
-        elif len(centers) < (self.n_heights * 0.75):
-            lookahead_y_frac = 0.75  # gần mũi xe
-
-        # Need 3+ unique y values for quadratic fit; fallback to linear
-        unique_ys = len(np.unique(ys))
-        if unique_ys < 2:
-            return None, None
-
-        try:
-            with warnings.catch_warnings():
-                warnings.simplefilter('ignore')
-                if unique_ys >= 3:
-                    coeffs = np.polyfit(ys, xs, 2)
-                else:
-                    coeffs = np.polyfit(ys, xs, 1)
-        except (np.linalg.LinAlgError, ValueError):
-            return None, None
-
-        poly_fn = np.poly1d(coeffs)
-
-        # Look-ahead point (tính từ đáy màn hình đi lên)
-        y_look = frame_h * (1.0 - lookahead_y_frac)
-        x_look = float(poly_fn(y_look))
-
-        # Điểm tâm xe (đáy màn hình)
-        car_center = frame_w / 2.0
-        
-        # Sai số đánh lái trong hệ tọa độ BEV
-        err = (x_look - car_center) / car_center
-        steer = np.clip(k_gain * np.clip(err, -1.0, 1.0), -1.0, 1.0)
-        
-        return float(steer), (float(x_look), float(y_look))
-
-# =========================
-# Main Display and Overlay
-# =========================
-def draw_overlay(original_frame: np.ndarray, bev: BirdEyeView, lefts: List, rights: List, target_point: Optional[Tuple], quality: float, frames_lost: int) -> np.ndarray:
-    """Vẽ vùng làn đường trên BEV, sau đó unwarp dán lên ảnh gốc."""
-    h, w = original_frame.shape[:2]
-    color_warp = np.zeros_like(original_frame)
-    
-    # 1. Vẽ đa giác làn đường trên ảnh trống BEV
-    if len(lefts) > 1 and len(rights) > 1:
-        poly_points = lefts + list(reversed(rights))
-        cv2.fillPoly(color_warp, [np.array(poly_points, dtype=np.int32)], (0, 255, 0))
-    
-    # 2. Unwarp cái vùng xanh lá đó trở lại góc 3D
-    newwarp = bev.unwarp(color_warp)
-    
-    # 3. Chồng ảnh
-    result = cv2.addWeighted(original_frame, 1, newwarp, 0.3, 0)
-    
-    # 4. Vẽ UI/UX
-    # Vẽ hình thang nguồn để debug góc cam
-    # src_pts order: BL(0), BR(1), TL(2), TR(3) — cần sắp xếp lại
-    # thành BL→BR→TR→TL (clockwise) để polylines vẽ hình thang, không phải đồng hồ cát
-    draw_pts = bev.src_pts[[0, 1, 3, 2]].astype(np.int32)
-    cv2.polylines(result, [draw_pts], isClosed=True, color=(0, 0, 255), thickness=2)
-    
-    # Bar chất lượng
-    bar_w = int(w * 0.3)
-    cv2.rectangle(result, (w - bar_w - 10, h - 30), (w - 10, h - 10), (0, 0, 255), -1)
-    cv2.rectangle(result, (w - bar_w - 10, h - 30), (w - bar_w - 10 + int(bar_w * quality), h - 10), (0, 255, 0), -1)
-    
-    if frames_lost > 5:
-        cv2.putText(result, "LANE LOST", (w//2 - 100, h//2), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 3)
-
-    return result
-
-def draw_bev_debug(bev_img: np.ndarray, centers: List, lefts: List, rights: List, target_point: Optional[Tuple], virtual_info: Dict) -> np.ndarray:
-    """Vẽ debug trên màn hình Bird's-Eye View"""
-    out = bev_img.copy()
-    for (x, y) in lefts: cv2.circle(out, (int(x), int(y)), 4, (0, 0, 255), -1)
-    for (x, y) in rights: cv2.circle(out, (int(x), int(y)), 4, (255, 0, 0), -1)
-    for c in centers: cv2.circle(out, (int(c[0]), int(c[1])), 4, (0, 255, 0), -1)
-    
-    if target_point:
-        cv2.line(out, (out.shape[1]//2, out.shape[0]), (int(target_point[0]), int(target_point[1])), (0, 255, 255), 2)
-        cv2.circle(out, (int(target_point[0]), int(target_point[1])), 8, (0, 255, 255), -1)
-
-    if virtual_info.get("used_virtual_left"): cv2.putText(out, "[V-LEFT]", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
-    if virtual_info.get("used_virtual_right"): cv2.putText(out, "[V-RIGHT]", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
-    
-    return out
-
-# =========================
-# Main Loop
-# =========================
 def main():
-    # Sử dụng video hoặc cam
     cap = cv2.VideoCapture(0)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-
-    # Khởi tạo ma trận biến đổi và bộ phát hiện làn
-    bev = BirdEyeView(w=640, h=480)
-    lane = PointsOfOrientationLane(n_heights=15, use_virtual_markers=True)
-    
+    tracker = UltimateDynamicTracker()
     while True:
-        ok, frame = cap.read()
-        if not ok: break
-        
-        # 1. Transform sang Bird's-Eye View
-        bev_frame = bev.warp(frame)
-        
-        # 2. Xử lý nhận diện trên ảnh BEV
-        centers, lefts, rights, debug = lane.detect(bev_frame)
-        
-        # 3. Tính góc lái trên BEV (Chính xác toán học nhất)
-        steer, target_bev = lane.compute_steering(centers, frame.shape[1], frame.shape[0], k_gain=1.15)
-        
-        # 4. Hiển thị
-        # Ảnh BEV Debug (Nhìn từ trên xuống)
-        bev_vis = draw_bev_debug(bev_frame, centers, lefts, rights, target_bev, debug["virtual_markers"])
-        
-        # Ảnh Canny Debug (Để thấy bộ lọc hoạt động tốt thế nào)
-        edges_bgr = cv2.cvtColor(debug["edges"], cv2.COLOR_GRAY2BGR)
-        
-        # Ảnh gốc hiển thị cho người lái (Dán mask xanh lá)
-        final_vis = draw_overlay(frame, bev, debug["extended_lefts"], debug["extended_rights"], target_bev, debug["lane_quality"], debug["frames_lost"])
-        
-        # In góc lái
-        steer_str = f"Steer: {steer:+.3f}" if steer is not None else "Steer: LOST"
-        cv2.putText(final_vis, steer_str, (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-
-        # Trình chiếu
-        cv2.imshow("Driver View (Unwarped)", final_vis)
-        cv2.imshow("BEV View (Processing)", bev_vis)
-        cv2.imshow("BEV Canny Edges", edges_bgr)
-        
+        ret, frame = cap.read()
+        if not ret: break
+        frame = cv2.resize(frame, (640, 480))
+        steer, viz, bev = tracker.process_frame(frame)1, cv2.LINE_AA
+        cv2.imshow("Main Output", viz)
+        cv2.imshow("BEV", bev)
         if cv2.waitKey(1) & 0xFF == ord('q'): break
-
     cap.release()
     cv2.destroyAllWindows()
 
