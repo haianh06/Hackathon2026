@@ -1,5 +1,6 @@
 import cv2
 import numpy as np
+import warnings
 from collections import deque
 import time
 from typing import Optional, Tuple, List, Dict
@@ -96,24 +97,27 @@ class PointsOfOrientationLane:
         # 1. Tiền xử lý ánh sáng bằng CLAHE
         lab = cv2.cvtColor(bev_bgr, cv2.COLOR_BGR2LAB)
         l_channel, a, b_channel = cv2.split(lab)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
         cl = clahe.apply(l_channel)
         limg = cv2.merge((cl, a, b_channel))
         bgr_enhanced = cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
 
-        # 2. Không gian màu HLS
+        # 2. Không gian màu HLS — ngưỡng trắng hạ xuống để bắt vạch trên sàn
         hls = cv2.cvtColor(bgr_enhanced, cv2.COLOR_BGR2HLS)
-        white = cv2.inRange(hls, (0, 200, 0), (180, 255, 255)) 
+        white = cv2.inRange(hls, (0, 140, 0), (180, 255, 80))
         yellow = cv2.inRange(hls, (15, 30, 115), (35, 204, 255))
         color_mask = cv2.bitwise_or(white, yellow)
-        
+
+        # 2b. Grayscale adaptive threshold fallback — bắt vạch trắng trên nền tối
+        gray = cv2.cvtColor(bgr_enhanced, cv2.COLOR_BGR2GRAY)
+        blur = cv2.GaussianBlur(gray, (5, 5), 0)
+        _, bright_mask = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        color_mask = cv2.bitwise_or(color_mask, bright_mask)
+
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
         color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_CLOSE, kernel)
 
         # 3. AUTO-CANNY
-        gray = cv2.cvtColor(bgr_enhanced, cv2.COLOR_BGR2GRAY)
-        blur = cv2.GaussianBlur(gray, (5, 5), 0)
-        
         v = np.median(blur)
         sigma = 0.33
         lower_canny = int(max(0, (1.0 - sigma) * v))
@@ -141,10 +145,15 @@ class PointsOfOrientationLane:
 
     def _fit_lane_poly(self, points: List[Tuple[float, float]]) -> Optional[np.ndarray]:
         if len(points) < 3: return None
-        xs = np.array([p[0] for p in points], dtype=np.float32)
-        ys = np.array([p[1] for p in points], dtype=np.float32)
+        xs = np.array([p[0] for p in points], dtype=np.float64)
+        ys = np.array([p[1] for p in points], dtype=np.float64)
+        unique_ys = len(np.unique(ys))
+        if unique_ys < 2: return None
         try:
-            return np.polyfit(ys, xs, 2)
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore')
+                deg = 2 if unique_ys >= 3 else 1
+                return np.polyfit(ys, xs, deg)
         except (np.linalg.LinAlgError, ValueError):
             return None
 
@@ -193,6 +202,10 @@ class PointsOfOrientationLane:
         
         centers, lefts, rights = [], [], []
 
+        # Biến đếm vạch thật để truncation logic
+        real_left_count = 0
+        real_right_count = 0
+
         for y in ys:
             row = edges[y, :]
             left_bound = max(0, int(x_center_ref - self.search_margin_px))
@@ -201,8 +214,17 @@ class PointsOfOrientationLane:
             xL = self._find_edge_x_in_row(row, x_center_ref, -1, left_bound, right_bound)
             xR = self._find_edge_x_in_row(row, x_center_ref, +1, left_bound, right_bound)
 
+            # --- TRUNCATION: dừng quét khi 1 vạch biến mất mà vạch kia vẫn còn ---
+            if (xL is not None) and (xR is None) and (real_right_count > 2):
+                break  # Vạch phải đã đứt, ngừng quét lên cao
+            if (xR is not None) and (xL is None) and (real_left_count > 2):
+                break  # Vạch trái đã đứt, ngừng quét lên cao
+
             if xL is None or xR is None: continue
             if (xR - xL) < self.min_lane_width_px: continue
+
+            real_left_count += 1
+            real_right_count += 1
 
             xC = 0.5 * (xL + xR)
             self.lane_width_history.append(xR - xL)
@@ -242,16 +264,35 @@ class PointsOfOrientationLane:
 
     def compute_steering(self, centers: List[Tuple[float, float]], frame_w: int, frame_h: int, k_gain: float = 1.15, lookahead_y_frac: float = 0.60) -> Tuple[Optional[float], Optional[Tuple[float, float]]]:
         if len(centers) < 2: return None, None
-        xs = np.array([p[0] for p in centers], dtype=np.float32)
-        ys = np.array([p[1] for p in centers], dtype=np.float32)
-        try:
-            a, b, c = np.polyfit(ys, xs, 2)
-        except np.linalg.LinAlgError:
+        xs = np.array([p[0] for p in centers], dtype=np.float64)
+        ys = np.array([p[1] for p in centers], dtype=np.float64)
+
+        # --- DYNAMIC LOOK-AHEAD: nhìn gần hơn khi đường ngắn (gần ngã rẽ) ---
+        if len(centers) < (self.n_heights * 0.5):
+            lookahead_y_frac = 0.85  # rất gần mũi xe
+        elif len(centers) < (self.n_heights * 0.75):
+            lookahead_y_frac = 0.75  # gần mũi xe
+
+        # Need 3+ unique y values for quadratic fit; fallback to linear
+        unique_ys = len(np.unique(ys))
+        if unique_ys < 2:
             return None, None
+
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore')
+                if unique_ys >= 3:
+                    coeffs = np.polyfit(ys, xs, 2)
+                else:
+                    coeffs = np.polyfit(ys, xs, 1)
+        except (np.linalg.LinAlgError, ValueError):
+            return None, None
+
+        poly_fn = np.poly1d(coeffs)
 
         # Look-ahead point (tính từ đáy màn hình đi lên)
         y_look = frame_h * (1.0 - lookahead_y_frac)
-        x_look = a*y_look*y_look + b*y_look + c
+        x_look = float(poly_fn(y_look))
 
         # Điểm tâm xe (đáy màn hình)
         car_center = frame_w / 2.0
@@ -283,8 +324,10 @@ def draw_overlay(original_frame: np.ndarray, bev: BirdEyeView, lefts: List, righ
     
     # 4. Vẽ UI/UX
     # Vẽ hình thang nguồn để debug góc cam
-    pts = bev.src_pts.astype(np.int32)
-    cv2.polylines(result, [pts], isClosed=True, color=(0, 0, 255), thickness=2)
+    # src_pts order: BL(0), BR(1), TL(2), TR(3) — cần sắp xếp lại
+    # thành BL→BR→TR→TL (clockwise) để polylines vẽ hình thang, không phải đồng hồ cát
+    draw_pts = bev.src_pts[[0, 1, 3, 2]].astype(np.int32)
+    cv2.polylines(result, [draw_pts], isClosed=True, color=(0, 0, 255), thickness=2)
     
     # Bar chất lượng
     bar_w = int(w * 0.3)

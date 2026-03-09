@@ -43,43 +43,39 @@ const BARRIERS = [
     { y: 508, xStart: 40, xEnd: 560 },
 ];
 
-// Direction arrows on roads — two-way (bidirectional) arrows
-// Each entry: [fromX, fromY, toX, toY]
-// Each road segment gets TWO arrows showing both directions
-const FLOW_ARROWS = [
-    // Top road (horizontal, two-way)
-    [140, 28, 300, 28],       // → right
-    [430, 42, 270, 42],       // ← left
-    // Below rect (horizontal, two-way)
-    [430, 203, 270, 203],     // ← left
-    [140, 217, 300, 217],     // → right
-    // Left side (vertical, two-way)
-    [43, 600, 43, 200],       // ↑ up
-    [57, 130, 57, 660],       // ↓ down
-    // Right side (vertical, two-way)
-    [543, 200, 543, 600],     // ↓ down
-    [557, 660, 557, 130],     // ↑ up
-    // Upper corridor (horizontal, two-way)
-    [140, 293, 300, 293],     // → right
-    [430, 307, 270, 307],     // ← left
-    // Center vertical (two-way)
-    [293, 340, 293, 430],     // ↓ down
-    [307, 430, 307, 340],     // ↑ up
-    // Lower corridor (horizontal, two-way)
-    [430, 463, 270, 463],     // ← left
-    [140, 477, 300, 477],     // → right
-    // Below barrier (horizontal, two-way)
-    [140, 538, 300, 538],     // → right
-    [430, 552, 270, 552],     // ← left
-    // Bottom road (horizontal, two-way)
-    [430, 763, 270, 763],     // ← left
-    [140, 777, 300, 777],     // → right
-    // Left bottom vertical (two-way)
-    [43, 720, 43, 500],       // ↑ up
-    [57, 500, 57, 720],       // ↓ down
-    // Right bottom vertical (two-way)
-    [543, 500, 543, 720],     // ↓ down
-    [557, 720, 557, 500],     // ↑ up
+// No separate FLOW_ARROWS — arrows are drawn inline on road connections
+
+// Road arrow rules per segment:
+// 'one-way': [fromId, toId] — single arrow in that direction
+// 'two-way': [id1, id2] — arrows in both directions
+// 'free': [id1, id2] — no arrows (free movement)
+// Connections not listed default to 'free'
+const ROAD_ARROWS = [
+    // Outer perimeter — one-way clockwise
+    { from: 'TL', to: 'B', type: 'one-way' },    // top →
+    { from: 'B', to: 'S', type: 'one-way' },      // top →
+    { from: 'S', to: 'P2', type: 'one-way' },     // right ↓
+    { from: 'P2', to: 'R1', type: 'one-way' },    // right ↓
+    { from: 'R1', to: 'C', type: 'one-way' },     // right ↓
+    { from: 'C', to: 'P8', type: 'one-way' },     // right ↓
+    { from: 'P8', to: 'P6', type: 'one-way' },    // right ↓
+    { from: 'P6', to: 'P9', type: 'one-way' },    // bottom ←
+    { from: 'P9', to: 'ST', type: 'one-way' },    // bottom ←
+    { from: 'ST', to: 'P7', type: 'one-way' },    // left ↑
+    { from: 'P7', to: 'A', type: 'one-way' },     // left ↑
+    { from: 'A', to: 'P3', type: 'one-way' },     // left ↑
+    { from: 'P3', to: 'P1', type: 'one-way' },    // left ↑
+    { from: 'P1', to: 'TL', type: 'one-way' },    // left ↑
+    // Between barriers — one-way (barrier separates into two-way system)
+    { from: 'P2', to: 'P1', type: 'one-way' },    // below rect ←
+    { from: 'P3', to: 'P4', type: 'one-way' },    // upper corridor →
+    { from: 'P4', to: 'R1', type: 'one-way' },    // upper corridor →
+    { from: 'C', to: 'P5', type: 'one-way' },     // lower corridor ←
+    { from: 'P5', to: 'A', type: 'one-way' },     // lower corridor ←
+    // Center vertical — two-way
+    { from: 'P4', to: 'P5', type: 'two-way' },    // ↓↑
+    // Below lower barrier & bottom — one-way (continuing perimeter pattern)
+    { from: 'P7', to: 'P8', type: 'one-way' },    // below barrier →
 ];
 
 const POINT_COLORS = {
@@ -139,35 +135,6 @@ function DemoMap({ points, vehiclePosition, activePath, livePos }) {
             ctx.stroke();
         });
 
-        // ── Direction arrows on roads ──
-        FLOW_ARROWS.forEach(([fx, fy, tx, ty]) => {
-            const mx = (fx + tx) / 2;
-            const my = (fy + ty) / 2;
-            const angle = Math.atan2(ty - fy, tx - fx);
-            const headLen = 12;
-
-            ctx.save();
-            ctx.translate(mx, my);
-            ctx.rotate(angle);
-            // Arrow shaft
-            const shaftLen = 20;
-            ctx.strokeStyle = 'rgba(255,255,255,0.5)';
-            ctx.lineWidth = 2;
-            ctx.beginPath();
-            ctx.moveTo(-shaftLen, 0);
-            ctx.lineTo(shaftLen, 0);
-            ctx.stroke();
-            // Arrow head
-            ctx.fillStyle = 'rgba(255,255,255,0.5)';
-            ctx.beginPath();
-            ctx.moveTo(headLen + 6, 0);
-            ctx.lineTo(-headLen / 2 + 6, -headLen / 2);
-            ctx.lineTo(-headLen / 2 + 6, headLen / 2);
-            ctx.closePath();
-            ctx.fill();
-            ctx.restore();
-        });
-
         if (!points || points.length === 0) {
             ctx.fillStyle = '#fff';
             ctx.font = '16px "Segoe UI", sans-serif';
@@ -179,7 +146,51 @@ function DemoMap({ points, vehiclePosition, activePath, livePos }) {
         const pointMap = {};
         points.forEach(p => { pointMap[p.pointId] = p; });
 
-        // ── Roads (connections) — thick gray road with dashed center ──
+        // Helper: draw a road arrow (shaft + head) between two points
+        const drawRoadArrow = (fx, fy, tx, ty, color, headSize) => {
+            const dx = tx - fx;
+            const dy = ty - fy;
+            const dist = Math.sqrt(dx * dx + dy * dy);
+            if (dist < 20) return;
+            const angle = Math.atan2(dy, dx);
+            // Shorten endpoints to avoid overlapping nodes
+            const shrink = 25;
+            const sx = fx + (dx / dist) * shrink;
+            const sy = fy + (dy / dist) * shrink;
+            const ex = tx - (dx / dist) * shrink;
+            const ey = ty - (dy / dist) * shrink;
+
+            // Shaft
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 2.5;
+            ctx.lineCap = 'round';
+            ctx.beginPath();
+            ctx.moveTo(sx, sy);
+            ctx.lineTo(ex, ey);
+            ctx.stroke();
+
+            // Arrow head
+            ctx.save();
+            ctx.translate(ex, ey);
+            ctx.rotate(angle);
+            ctx.fillStyle = color;
+            ctx.beginPath();
+            ctx.moveTo(headSize, 0);
+            ctx.lineTo(-headSize * 0.7, -headSize * 0.6);
+            ctx.lineTo(-headSize * 0.7, headSize * 0.6);
+            ctx.closePath();
+            ctx.fill();
+            ctx.restore();
+        };
+
+        // Build a lookup for arrow rules
+        const arrowLookup = {};
+        ROAD_ARROWS.forEach(rule => {
+            const key = [rule.from, rule.to].sort().join('-');
+            arrowLookup[key] = rule;
+        });
+
+        // ── Roads (connections) — thick gray road ──
         const drawnEdges = new Set();
         points.forEach(point => {
             (point.connections || []).forEach(connId => {
@@ -189,7 +200,7 @@ function DemoMap({ points, vehiclePosition, activePath, livePos }) {
                 const t = pointMap[connId];
                 if (!t) return;
 
-                // Road bed (dark gray)
+                // Road bed (dark gray border)
                 ctx.strokeStyle = '#757575';
                 ctx.lineWidth = 28;
                 ctx.lineCap = 'round';
@@ -199,14 +210,37 @@ function DemoMap({ points, vehiclePosition, activePath, livePos }) {
                 ctx.strokeStyle = '#9e9e9e';
                 ctx.lineWidth = 24;
                 ctx.beginPath(); ctx.moveTo(point.x, point.y); ctx.lineTo(t.x, t.y); ctx.stroke();
-
-                // Road center dashed line (white)
-                ctx.strokeStyle = 'rgba(255,255,255,0.7)';
-                ctx.lineWidth = 2;
-                ctx.setLineDash([8, 8]);
-                ctx.beginPath(); ctx.moveTo(point.x, point.y); ctx.lineTo(t.x, t.y); ctx.stroke();
-                ctx.setLineDash([]);
             });
+        });
+
+        // ── Draw direction arrows on roads ──
+        const arrowColor = 'rgba(255,255,255,0.75)';
+        const arrowSize = 10;
+        const drawnArrowEdges = new Set();
+
+        ROAD_ARROWS.forEach(rule => {
+            const p1 = pointMap[rule.from];
+            const p2 = pointMap[rule.to];
+            if (!p1 || !p2) return;
+            const ek = [rule.from, rule.to].sort().join('-');
+            drawnArrowEdges.add(ek);
+
+            if (rule.type === 'one-way') {
+                drawRoadArrow(p1.x, p1.y, p2.x, p2.y, arrowColor, arrowSize);
+            } else if (rule.type === 'two-way') {
+                // Two parallel arrows with offset
+                const dx = p2.x - p1.x;
+                const dy = p2.y - p1.y;
+                const dist = Math.sqrt(dx * dx + dy * dy);
+                if (dist < 20) return;
+                const angle = Math.atan2(dy, dx);
+                const off = 5; // offset perpendicular to road
+                const offX = Math.cos(angle + Math.PI / 2) * off;
+                const offY = Math.sin(angle + Math.PI / 2) * off;
+                drawRoadArrow(p1.x + offX, p1.y + offY, p2.x + offX, p2.y + offY, arrowColor, arrowSize * 0.8);
+                drawRoadArrow(p2.x - offX, p2.y - offY, p1.x - offX, p1.y - offY, arrowColor, arrowSize * 0.8);
+            }
+            // 'free' type: no arrows drawn
         });
 
         // ── Active path (Dijkstra result) ──

@@ -26,7 +26,6 @@ RUN python3 -m venv --system-site-packages /app/hardware/venv && \
     /app/hardware/venv/bin/pip install --no-cache-dir \
     "lgpio" \
     "spidev" \
-    "mfrc522" \
     "aiohttp>=3.9.0" \
     "python-socketio[asyncio_client]>=5.11.0" \
     "aiohttp-cors>=0.7.0" \

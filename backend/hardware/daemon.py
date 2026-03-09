@@ -34,12 +34,11 @@ from motor_control import create_motor_controller, AutoNavigator
 from camera_mjpeg import CameraManager
 from line_follower import LineFollower
 
-# RFID reader (MFRC522 via SPI)
+# RFID reader (custom spidev + lgpio driver for Pi 5)
 try:
-    from mfrc522 import SimpleMFRC522
-    import spidev
+    from rfid_reader import MFRC522Reader
     RFID_AVAILABLE = True
-    logger.info("MFRC522 RFID reader module loaded")
+    logger.info("MFRC522 RFID reader module loaded (spidev+lgpio)")
 except ImportError as e:
     RFID_AVAILABLE = False
     logger.warning(f"RFID reader not available: {e}")
@@ -47,17 +46,12 @@ except ImportError as e:
 # Import canny edge detection
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'canny-edge-detection-main'))
 try:
-    from test_1_improved import (
-        PointsOfOrientationLane as CannyLaneDetector,
-        BirdEyeView as CannyBEV,
-        draw_overlay as canny_draw_overlay,
-        draw_bev_debug as canny_draw_bev_debug,
-    )
+    from lane_dynamic_center import DynamicLaneTracker
     CANNY_AVAILABLE = True
-    logger.info("Canny edge detection loaded successfully")
+    logger.info("Dynamic lane tracker loaded successfully")
 except ImportError as e:
     CANNY_AVAILABLE = False
-    logger.warning(f"Canny edge detection not available: {e}")
+    logger.warning(f"Dynamic lane tracker not available: {e}")
 
 # Socket.IO client
 try:
@@ -101,23 +95,21 @@ class HardwareDaemon:
         self._map_y = 0  # grid coordinate y
         self._map_direction = 0  # 0=up(+y), 1=right(+x), 2=down(-y), 3=left(-x)
         self._map_step_count = 0
-        self._canny_bev = CannyBEV(640, 480) if CANNY_AVAILABLE else None
-        self._canny_detector = CannyLaneDetector(
-            n_heights=15,
-            search_margin_px=150,
-            min_lane_width_px=100,
-            ema_center_alpha=0.35,
-            max_frames_lost=30,
-            use_virtual_markers=True,
-        ) if CANNY_AVAILABLE else None
+        self._lane_tracker = DynamicLaneTracker(width=640, height=480) if CANNY_AVAILABLE else None
 
         # ── RFID scanner state ──
         self._rfid_scanning = False
         self._rfid_reader = None
         if RFID_AVAILABLE:
+            rfid_cfg = CONFIG.get('rfid', {})
             try:
-                self._rfid_reader = SimpleMFRC522()
-                logger.info("RFID reader initialized")
+                self._rfid_reader = MFRC522Reader(
+                    bus=rfid_cfg.get('bus', 0),
+                    device=rfid_cfg.get('device', 0),
+                    rst_pin=rfid_cfg.get('rst_pin', 25),
+                    gpio_chip=rfid_cfg.get('gpio_chip', 0),
+                )
+                logger.info("RFID reader initialized successfully")
             except Exception as e:
                 logger.warning(f"RFID reader init failed: {e}")
 
@@ -332,30 +324,17 @@ class HardwareDaemon:
                 virtual_info_str = ""
 
                 frame_bytes = await self.camera.get_latest_frame()
-                if frame_bytes and CANNY_AVAILABLE and self._canny_detector and self._canny_bev:
+                if frame_bytes and CANNY_AVAILABLE and self._lane_tracker:
                     try:
                         nparr = np.frombuffer(frame_bytes, np.uint8)
                         frame_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
                         if frame_bgr is not None:
-                            h, w = frame_bgr.shape[:2]
-                            # Warp to BEV then detect
-                            bev_frame = self._canny_bev.warp(frame_bgr)
-                            centers, lefts, rights, debug = self._canny_detector.detect(bev_frame)
-                            steer_val, target = self._canny_detector.compute_steering(
-                                centers, w, h, k_gain=1.0)
+                            steer_val, quality, debug, _ = self._lane_tracker.detect_and_steer(frame_bgr)
+                            centers_count = debug.get('real_count', 0)
 
-                            quality = debug.get('lane_quality', 0.0)
-                            centers_count = len(centers)
-
-                            if steer_val is not None and quality >= QUALITY_MIN and centers_count >= 2:
+                            if quality >= QUALITY_MIN and centers_count >= 2:
                                 canny_steer = steer_val
                                 frames_ok += 1
-
-                            virt = debug.get('virtual_markers', {})
-                            if virt.get('used_virtual_left'):
-                                virtual_info_str += " [V-L]"
-                            if virt.get('used_virtual_right'):
-                                virtual_info_str += " [V-R]"
                     except Exception as e:
                         logger.debug(f"Step loop detect error: {e}")
 
@@ -473,8 +452,8 @@ class HardwareDaemon:
             self.motor.stop()
 
     async def _do_canny_analysis(self):
-        """Run canny edge detection on current frame (BEV-first pipeline)."""
-        if not CANNY_AVAILABLE or self._canny_detector is None or self._canny_bev is None:
+        """Run dynamic lane detection on current frame."""
+        if not CANNY_AVAILABLE or self._lane_tracker is None:
             return None
 
         frame_bytes = await self.camera.get_latest_frame()
@@ -489,33 +468,27 @@ class HardwareDaemon:
                 return None
 
             h, w = frame.shape[:2]
-            bev_frame = self._canny_bev.warp(frame)
-            centers, lefts, rights, debug = self._canny_detector.detect(bev_frame)
-            steer, target = self._canny_detector.compute_steering(
-                centers, w, h, k_gain=1.0)
+            steer, quality, debug, _ = self._lane_tracker.detect_and_steer(frame)
 
             midpoint = None
-            if len(centers) > 0:
-                nearest = max(centers, key=lambda p: p[1])
-                midpoint = {'x': float(nearest[0]), 'y': float(nearest[1])}
-
-            virtual = debug.get('virtual_markers', {})
+            if 'mid_bot' in debug:
+                midpoint = {'x': float(debug['mid_bot']), 'y': float(self._lane_tracker.y_bottom)}
 
             return {
-                'steering': float(steer) if steer is not None else 0.0,
-                'laneQuality': float(debug.get('lane_quality', 0)),
-                'centersCount': len(centers),
-                'leftsCount': len(lefts),
-                'rightsCount': len(rights),
+                'steering': float(steer),
+                'laneQuality': float(quality),
+                'centersCount': debug.get('real_count', 0),
+                'leftsCount': 0,
+                'rightsCount': 0,
                 'midpoint': midpoint,
                 'frameWidth': w,
                 'frameHeight': h,
                 'framesLost': debug.get('frames_lost', 0),
-                'virtualLeft': virtual.get('used_virtual_left', False),
-                'virtualRight': virtual.get('used_virtual_right', False),
+                'virtualLeft': False,
+                'virtualRight': False,
             }
         except Exception as e:
-            logger.error(f"Canny analysis error: {e}")
+            logger.error(f"Lane analysis error: {e}")
             return None
 
     async def _get_unet_correction(self):
@@ -589,8 +562,8 @@ class HardwareDaemon:
     def _rfid_read_once(self):
         """Blocking read of one RFID tag. Called in executor thread."""
         try:
-            uid, text = self._rfid_reader.read_no_block()
-            return uid, text
+            uid = self._rfid_reader.read_id_no_block()
+            return uid, ''
         except Exception:
             return None, None
 
@@ -721,38 +694,26 @@ class HardwareDaemon:
             await response.prepare(request)
             boundary = b'--frame'
 
-            if not CANNY_AVAILABLE or not self._canny_detector or not self._canny_bev:
-                logger.warning("Canny stream requested but CANNY_AVAILABLE=%s, detector=%s",
-                               CANNY_AVAILABLE, self._canny_detector is not None)
+            if not CANNY_AVAILABLE or not self._lane_tracker:
+                logger.warning("Lane stream requested but CANNY_AVAILABLE=%s, tracker=%s",
+                               CANNY_AVAILABLE, self._lane_tracker is not None)
 
             try:
                 while True:
                     frame_bytes = await self.camera.get_latest_frame()
                     if frame_bytes:
-                        if CANNY_AVAILABLE and self._canny_detector and self._canny_bev:
+                        if CANNY_AVAILABLE and self._lane_tracker:
                             try:
                                 nparr = np.frombuffer(frame_bytes, np.uint8)
                                 frame_bgr = _cv2.imdecode(nparr, _cv2.IMREAD_COLOR)
                                 if frame_bgr is not None:
                                     h, w = frame_bgr.shape[:2]
-                                    # BEV-first pipeline
-                                    bev_frame = self._canny_bev.warp(frame_bgr)
-                                    centers, lefts, rights, debug_info = self._canny_detector.detect(bev_frame)
-                                    steer, target = self._canny_detector.compute_steering(
-                                        centers, w, h, k_gain=1.0)
-                                    quality = debug_info.get('lane_quality', 0.0)
+                                    steer, quality, debug_info, vis = self._lane_tracker.detect_and_steer(frame_bgr)
                                     frames_lost = debug_info.get('frames_lost', 0)
 
-                                    # Draw overlay on original frame (unwarp lane fill)
-                                    vis = canny_draw_overlay(
-                                        frame_bgr, self._canny_bev,
-                                        debug_info.get('extended_lefts', lefts),
-                                        debug_info.get('extended_rights', rights),
-                                        target, quality, frames_lost
-                                    )
                                     # Add position + steer text
                                     pos_text = f"Pos: ({self._map_x},{self._map_y}) Dir: {self._direction_name()}"
-                                    steer_text = f"Steer: {steer:+.3f}" if steer is not None else "Steer: LOST"
+                                    steer_text = f"Steer: {steer:+.3f}"
                                     q_text = f"Quality: {quality:.0%} | Lost: {frames_lost}"
                                     _cv2.putText(vis, pos_text, (15, h - 70), _cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
                                     _cv2.putText(vis, steer_text, (15, h - 45), _cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
@@ -760,7 +721,7 @@ class HardwareDaemon:
                                     _, jpeg = _cv2.imencode('.jpg', vis, [_cv2.IMWRITE_JPEG_QUALITY, 75])
                                     frame_bytes = jpeg.tobytes()
                             except Exception as e:
-                                logger.warning(f"Canny overlay error: {e}", exc_info=True)
+                                logger.warning(f"Lane overlay error: {e}", exc_info=True)
                                 # Draw error text on raw frame so the user sees what's wrong
                                 try:
                                     nparr = np.frombuffer(frame_bytes, np.uint8)
@@ -809,29 +770,17 @@ class HardwareDaemon:
             frame_bytes = await self.camera.get_latest_frame()
             if not frame_bytes:
                 return web.Response(status=503, text='No frame')
-            if CANNY_AVAILABLE and self._canny_detector and self._canny_bev:
+            if CANNY_AVAILABLE and self._lane_tracker:
                 try:
                     import cv2
                     nparr = np.frombuffer(frame_bytes, np.uint8)
                     frame_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
                     if frame_bgr is not None:
-                        h, w = frame_bgr.shape[:2]
-                        bev_frame = self._canny_bev.warp(frame_bgr)
-                        centers, lefts, rights, debug_info = self._canny_detector.detect(bev_frame)
-                        steer, target = self._canny_detector.compute_steering(
-                            centers, w, h, k_gain=1.0)
-                        quality = debug_info.get('lane_quality', 0.0)
-                        frames_lost = debug_info.get('frames_lost', 0)
-                        vis = canny_draw_overlay(
-                            frame_bgr, self._canny_bev,
-                            debug_info.get('extended_lefts', lefts),
-                            debug_info.get('extended_rights', rights),
-                            target, quality, frames_lost
-                        )
+                        _, _, _, vis = self._lane_tracker.detect_and_steer(frame_bgr)
                         _, jpeg = cv2.imencode('.jpg', vis, [cv2.IMWRITE_JPEG_QUALITY, 85])
                         frame_bytes = jpeg.tobytes()
                 except Exception as e:
-                    logger.debug(f"Canny snapshot error: {e}")
+                    logger.debug(f"Lane snapshot error: {e}")
             return web.Response(body=frame_bytes, content_type='image/jpeg')
 
         r_canny_stream = cors.add(app.router.add_resource('/canny/stream'))
