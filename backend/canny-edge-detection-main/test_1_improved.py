@@ -28,10 +28,16 @@ class UltimateDynamicTracker:
         self.default_lane_width = int(self.w * 0.6)
         self.lane_width_history = deque(maxlen=30)
         
+        # Vị trí kỳ vọng ban đầu cho thuật toán Cửa sổ trượt (Sliding Window)
+        self.l_bot_exp = int(self.w * 0.15)
+        self.r_bot_exp = int(self.w * 0.85)
+        self.l_top_exp = int(self.w * 0.35)
+        self.r_top_exp = int(self.w * 0.65)
+        
         # Hình thang dự phòng chuẩn xác
         self.prev_src_pts = np.float32([
-            [int(self.w * 0.1), self.y_bottom], [int(self.w * 0.9), self.y_bottom],
-            [int(self.w * 0.3), self.y_top], [int(self.w * 0.7), self.y_top]
+            [self.l_bot_exp, self.y_bottom], [self.r_bot_exp, self.y_bottom],
+            [self.l_top_exp, self.y_top], [self.r_top_exp, self.y_top]
         ])
 
         self.Kp = 0.85
@@ -39,7 +45,7 @@ class UltimateDynamicTracker:
         self.steer_ema = EMAFilter(alpha=0.3)
 
     # ==========================================
-    # CẢI TIẾN 1: TÁCH NỀN SIÊU SẠCH CHO THẢM XÁM / VẠCH TRẮNG
+    # CẢI TIẾN 1: TÁCH NỀN SIÊU SẠCH (Từ phiên bản của bạn)
     # ==========================================
     def _get_clean_mask(self, bgr_img: np.ndarray) -> np.ndarray:
         """Chỉ tập trung bắt màu sáng/trắng, loại bỏ nhiễu Canny rối rắm"""
@@ -47,7 +53,7 @@ class UltimateDynamicTracker:
         blur = cv2.GaussianBlur(gray, (5, 5), 0)
         
         # Lọc nhị phân: Chỉ giữ lại các pixel cực sáng (vạch trắng). 
-        # LƯU Ý: Nếu phòng tối, hãy giảm số 180 xuống (VD: 150). Nếu phòng sáng chói, tăng lên 200.
+        # LƯU Ý: Có thể chỉnh 180 tùy độ sáng môi trường.
         _, mask = cv2.threshold(blur, 180, 255, cv2.THRESH_BINARY)
         
         # Xóa các đốm nhiễu nhỏ
@@ -57,34 +63,33 @@ class UltimateDynamicTracker:
         return mask
 
     # ==========================================
-    # CẢI TIẾN 2: THUẬT TOÁN QUÉT TIA (RAYCAST) CHỐNG CHÉO HÌNH THANG
+    # CẢI TIẾN 2: CỬA SỔ TRƯỢT CHỐNG NGÃ TƯ (Thay thế hoàn toàn Raycast)
     # ==========================================
-    def _scan_outwards(self, row_mask: np.ndarray, start_x: int) -> Tuple[Optional[int], Optional[int]]:
-        """Bắn tia từ giữa xe sang 2 bên để tìm mép trong của vạch trắng"""
-        row_1d = row_mask  # Lấy mảng 1D pixel trắng/đen
+    def _find_line_near(self, mask_1d: np.ndarray, expected_x: int, window: int = 80) -> Optional[int]:
+        """Chỉ quét tìm vạch trong một giới hạn (window) quanh vị trí cũ"""
+        start = max(0, expected_x - window)
+        end = min(self.w, expected_x + window)
         
-        l_pt = None
-        r_pt = None
+        local_slice = mask_1d[start:end]
+        white_indices = np.where(local_slice > 0)[0]
         
-        # 1. Quét từ tâm sang TRÁI
-        for x in range(start_x, 0, -1):
-            if row_1d[x] > 0:  # Chạm pixel trắng đầu tiên
-                l_pt = x
-                break
-                
-        # 2. Quét từ tâm sang PHẢI
-        for x in range(start_x, self.w - 1):
-            if row_1d[x] > 0:  # Chạm pixel trắng đầu tiên
-                r_pt = x
-                break
-                
-        return l_pt, r_pt
+        if len(white_indices) == 0:
+            return None  # Không thấy vạch
+            
+        # TÍNH NĂNG VÀNG: ĐÓNG BĂNG KHI GẶP VẠCH NGANG (NGÃ TƯ)
+        # Nếu vạch trắng lấp đầy > 75% cửa sổ -> Chắc chắn là ngã tư -> Trả về vị trí cũ để đi thẳng
+        if len(white_indices) > (end - start) * 0.75:
+            return expected_x 
+            
+        # Nếu bình thường, tính tâm của vạch trắng trong cửa sổ
+        local_center = int(np.mean(white_indices))
+        return start + local_center
 
     def process_frame(self, frame: np.ndarray):
         mask = self._get_clean_mask(frame)
         viz_frame = frame.copy()
         
-        # Hiển thị mask nhỏ ở góc màn hình để bạn dễ debug độ sáng
+        # Hiển thị mask nhỏ ở góc màn hình để dễ debug độ sáng
         mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
         mask_small = cv2.resize(mask_bgr, (160, 120))
         viz_frame[0:120, 0:160] = mask_small
@@ -92,13 +97,18 @@ class UltimateDynamicTracker:
 
         car_center_x = self.w // 2
 
-        # Lấy 2 dòng pixel (quét ngang) tại y_bottom và y_top
-        row_bot = mask[self.y_bottom, :]
-        row_top = mask[self.y_top, :]
+        # Lấy dải ảnh (slice) dày 10 pixel thay vì 1 pixel để chống nhiễu đứt đoạn
+        slice_h = 5
+        bot_slice = mask[max(0, self.y_bottom - slice_h) : min(self.h, self.y_bottom + slice_h), :]
+        top_slice = mask[max(0, self.y_top - slice_h) : min(self.h, self.y_top + slice_h), :]
+        row_bot = np.max(bot_slice, axis=0)
+        row_top = np.max(top_slice, axis=0)
 
-        # Dùng thuật toán tia quét để tìm điểm neo
-        l_bot, r_bot = self._scan_outwards(row_bot, car_center_x)
-        l_top, r_top = self._scan_outwards(row_top, car_center_x)
+        # Quét tìm vạch bằng Cửa sổ trượt (Sliding Window)
+        l_bot = self._find_line_near(row_bot, self.l_bot_exp, window=100)
+        r_bot = self._find_line_near(row_bot, self.r_bot_exp, window=100)
+        l_top = self._find_line_near(row_top, self.l_top_exp, window=70)
+        r_top = self._find_line_near(row_top, self.r_top_exp, window=70)
 
         # Logic nội suy độ rộng làn đường
         valid_widths = []
@@ -117,10 +127,16 @@ class UltimateDynamicTracker:
         steer_final = 0.0
         bev_vis = np.zeros((self.h, self.w, 3), dtype=np.uint8)
 
-        # ĐIỀU KIỆN CHẶT CHẼ: Hình thang không được phép chéo nhau (l_bot phải < r_bot)
+        # ĐIỀU KIỆN CHẶT CHẼ: Hình thang không được phép chéo nhau
         if (l_bot is not None and r_bot is not None and l_top is not None and r_top is not None 
             and l_bot < r_bot and l_top < r_top):
             
+            # CẬP NHẬT VỊ TRÍ KỲ VỌNG CHO KHUNG HÌNH SAU (Giúp cửa sổ trượt bám theo cua)
+            self.l_bot_exp = int(0.7 * self.l_bot_exp + 0.3 * l_bot)
+            self.r_bot_exp = int(0.7 * self.r_bot_exp + 0.3 * r_bot)
+            self.l_top_exp = int(0.7 * self.l_top_exp + 0.3 * l_top)
+            self.r_top_exp = int(0.7 * self.r_top_exp + 0.3 * r_top)
+
             mid_bot_x = int((l_bot + r_bot) / 2)
             mid_top_x = int((l_top + r_top) / 2)
             point_of_orientation = (mid_top_x, self.y_top)
@@ -142,6 +158,12 @@ class UltimateDynamicTracker:
             cv2.putText(viz_frame, "Point of Orientation", (mid_top_x + 15, self.y_top), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
+            # Vẽ các ô tìm kiếm (Sliding Windows) màu xanh dương để debug
+            cv2.rectangle(viz_frame, (self.l_bot_exp - 100, self.y_bottom-10), (self.l_bot_exp + 100, self.y_bottom+10), (255,0,0), 1)
+            cv2.rectangle(viz_frame, (self.r_bot_exp - 100, self.y_bottom-10), (self.r_bot_exp + 100, self.y_bottom+10), (255,0,0), 1)
+            cv2.rectangle(viz_frame, (self.l_top_exp - 70, self.y_top-10), (self.l_top_exp + 70, self.y_top+10), (255,0,0), 1)
+            cv2.rectangle(viz_frame, (self.r_top_exp - 70, self.y_top-10), (self.r_top_exp + 70, self.y_top+10), (255,0,0), 1)
+
             # PD Controller
             e_offset = (mid_bot_x - car_center_x) / (self.w / 2.0)
             e_heading = (mid_top_x - mid_bot_x) / (self.w / 2.0)
@@ -158,15 +180,15 @@ class UltimateDynamicTracker:
             mask_bev_bgr = cv2.cvtColor(mask_bev, cv2.COLOR_GRAY2BGR)
             bev_vis = cv2.addWeighted(bev_vis, 0.7, mask_bev_bgr, 1.0, 0)
             
-            cv2.line(bev_vis, (self.w//2, self.h), (self.w//2, 0), (0, 255, 0), 2, cv2.LINE_DASH)
+            cv2.line(bev_vis, (self.w//2, self.h), (self.w//2, 0), (0, 255, 0), 1, cv2.LINE_AA)
             
         else:
-            # Nếu vi phạm điều kiện (ví dụ 2 vạch chéo nhau), sử dụng bộ nhớ cũ!
+            # FALLBACK: Giữ bộ nhớ cũ khi hình thang chéo nhau hoặc mất vạch!
             steer_final = self.steer_ema.update(None)
             cv2.putText(viz_frame, "FALLBACK: KEEPING PREVIOUS SHAPE", (180, 80), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
             
-            # Vẽ lại hình thang cũ mờ hơn để báo hiệu
+            # Vẽ lại hình thang cũ mờ hơn (màu đỏ) để báo hiệu
             trap_pts = np.array([[self.prev_src_pts[0][0], self.prev_src_pts[0][1]], 
                                  [self.prev_src_pts[2][0], self.prev_src_pts[2][1]], 
                                  [self.prev_src_pts[3][0], self.prev_src_pts[3][1]], 
@@ -183,7 +205,7 @@ def main():
         ret, frame = cap.read()
         if not ret: break
         frame = cv2.resize(frame, (640, 480))
-        steer, viz, bev = tracker.process_frame(frame)1, cv2.LINE_AA
+        steer, viz, bev = tracker.process_frame(frame)
         cv2.imshow("Main Output", viz)
         cv2.imshow("BEV", bev)
         if cv2.waitKey(1) & 0xFF == ord('q'): break

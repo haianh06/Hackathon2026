@@ -85,32 +85,34 @@ class MapService {
 
         const demoPoints = [
             // Row 0 (top) — horizontal road across top (→ right)
-            { pointId: 'TL', x: 50, y: 35, label: 'Góc trên trái', type: 'waypoint', connections: ['B', 'P1'] },
-            { pointId: 'B', x: 300, y: 35, label: 'Điểm B', type: 'destination', connections: ['TL', 'S'] },
-            { pointId: 'S', x: 550, y: 35, label: 'Start (Xuất phát)', type: 'start', connections: ['B', 'P2'] },
+            { pointId: 'TL', x: 50, y: 30, label: 'Góc trên trái', type: 'waypoint', connections: ['B', 'P1'] },
+            { pointId: 'B', x: 300, y: 30, label: 'Điểm B', type: 'destination', connections: ['TL', 'S'] },
+            { pointId: 'S', x: 550, y: 30, label: 'Start (Xuất phát)', type: 'start', connections: ['B', 'P3'] },
 
-            // Row 1 (below rectangle) — horizontal road (← left)
-            { pointId: 'P1', x: 50, y: 210, label: 'Dưới rect trái', type: 'waypoint', connections: ['TL', 'P2', 'P3'] },
-            { pointId: 'P2', x: 550, y: 210, label: 'Dưới rect phải', type: 'waypoint', connections: ['S', 'P1', 'R1'] },
+            // Row 1 (below building) — horizontal road (← left)
+            { pointId: 'P1', x: 50, y: 195, label: 'Ngã tư trái 1', type: 'intersection', connections: ['TL', 'P2', 'P4'] },
+            { pointId: 'P2', x: 300, y: 195, label: 'Trung gian trên', type: 'waypoint', connections: ['P1', 'P3'] },
+            { pointId: 'P3', x: 550, y: 195, label: 'Ngã tư phải 1', type: 'intersection', connections: ['S', 'P2', 'R1'] },
 
             // Row 2 (upper corridor) — horizontal road (→ right)
-            { pointId: 'P3', x: 50, y: 300, label: 'Ngã tư trái trên', type: 'intersection', connections: ['P1', 'P4', 'A'] },
-            { pointId: 'P4', x: 300, y: 300, label: 'Ngã tư trung tâm', type: 'intersection', connections: ['P3', 'R1', 'P5'] },
-            { pointId: 'R1', x: 550, y: 300, label: 'Ngã tư phải trên', type: 'intersection', connections: ['P2', 'P4', 'C'] },
+            { pointId: 'P4', x: 50, y: 275, label: 'Ngã tư trái 2', type: 'intersection', connections: ['P1', 'P5', 'A'] },
+            { pointId: 'P5', x: 300, y: 275, label: 'Ngã tư trung tâm trên', type: 'intersection', connections: ['P4', 'R1', 'P6'] },
+            { pointId: 'R1', x: 550, y: 275, label: 'Ngã tư phải 2', type: 'intersection', connections: ['P5', 'P3', 'C'] },
 
             // Row 3 (lower corridor) — horizontal road (← left)
-            { pointId: 'A', x: 50, y: 470, label: 'Điểm A', type: 'destination', connections: ['P3', 'P5', 'P7'] },
-            { pointId: 'P5', x: 300, y: 470, label: 'Ngã tư trung tâm dưới', type: 'intersection', connections: ['P4', 'A', 'C'] },
-            { pointId: 'C', x: 550, y: 470, label: 'Điểm C', type: 'destination', connections: ['R1', 'P5', 'P8'] },
+            { pointId: 'A', x: 50, y: 410, label: 'Điểm A', type: 'destination', connections: ['P4', 'P6', 'P7'] },
+            { pointId: 'P6', x: 300, y: 410, label: 'Ngã tư trung tâm dưới', type: 'intersection', connections: ['A', 'C', 'P5'] },
+            { pointId: 'C', x: 550, y: 410, label: 'Điểm C', type: 'destination', connections: ['R1', 'P6', 'P9'] },
 
             // Row 4 (below lower barrier) — horizontal road (→ right)
-            { pointId: 'P7', x: 50, y: 545, label: 'Dưới barrier trái', type: 'waypoint', connections: ['A', 'P8', 'ST'] },
-            { pointId: 'P8', x: 550, y: 545, label: 'Dưới barrier phải', type: 'waypoint', connections: ['C', 'P7', 'P6'] },
+            { pointId: 'P7', x: 50, y: 490, label: 'Góc trái dưới', type: 'waypoint', connections: ['A', 'P8', 'ST'] },
+            { pointId: 'P8', x: 300, y: 490, label: 'Ngã tư dưới giữa', type: 'intersection', connections: ['P7', 'P9', 'P10'] },
+            { pointId: 'P9', x: 550, y: 490, label: 'Ngã tư phải dưới', type: 'intersection', connections: ['P8', 'C', 'P11'] },
 
             // Row 5 (bottom) — horizontal road (← left)
-            { pointId: 'ST', x: 50, y: 770, label: 'Stop (Kết thúc)', type: 'stop', connections: ['P7', 'P9'] },
-            { pointId: 'P9', x: 300, y: 770, label: 'Dưới trung tâm', type: 'waypoint', connections: ['ST', 'P6'] },
-            { pointId: 'P6', x: 550, y: 770, label: 'Góc dưới phải', type: 'waypoint', connections: ['P8', 'P9'] },
+            { pointId: 'ST', x: 50, y: 668, label: 'Stop (Kết thúc)', type: 'stop', connections: ['P7', 'P10'] },
+            { pointId: 'P10', x: 300, y: 668, label: 'Trung gian dưới', type: 'waypoint', connections: ['ST', 'P11', 'P8'] },
+            { pointId: 'P11', x: 550, y: 668, label: 'Góc dưới phải', type: 'waypoint', connections: ['P10', 'P9'] },
         ];
 
         await MapPoint.insertMany(demoPoints);

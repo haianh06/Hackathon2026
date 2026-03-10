@@ -197,35 +197,25 @@ class LineFollower:
         self._init_canny_detector()
 
     def _init_canny_detector(self):
-        """Lazily initialise the canny edge detector for fusion mode."""
+        """Lazily initialise the canny edge detector (UltimateDynamicTracker).
+
+        Canny is the PRIMARY steering source — it computes the Point of
+        Orientation from edge detection and drives a PD controller.
+        UNet is only used as a secondary lane-passability check.
+        """
         try:
             import sys
             canny_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                       '..', 'canny-edge-detection-main')
             if canny_path not in sys.path:
                 sys.path.insert(0, canny_path)
-            from test_1_improved import PointsOfOrientationLane
-            self._canny_detector = PointsOfOrientationLane(
-                n_heights=12,
-                roi_top_frac=0.50,
-                heights_frac=(0.92, 0.60),
-                canny1=50,
-                canny2=150,
-                search_margin_px=220,
-                min_lane_width_px=30,
-                ema_center_alpha=0.30,
-                max_frames_lost=45,
-                use_virtual_markers=True,
-                use_bev=True,
-                use_sliding_window=True,
-                frame_w=640,
-                frame_h=480,
-            )
+            from test_1_improved import UltimateDynamicTracker
+            self._canny_detector = UltimateDynamicTracker(width=640, height=480)
             self._canny_available = True
-            logger.info("✅ Canny detector loaded for fusion lane following")
+            logger.info("✅ Canny UltimateDynamicTracker loaded for PRIMARY lane steering")
         except Exception as e:
             self._canny_available = False
-            logger.debug(f"Canny detector not available for fusion: {e}")
+            logger.debug(f"Canny detector not available: {e}")
 
     # ── Fallback: simple colour thresholding (no model needed) ──
     def _init_cv2_fallback(self):
@@ -254,7 +244,16 @@ class LineFollower:
     def analyse_frame(self, jpeg_bytes):
         """
         Analyse a JPEG frame and return EMA-smoothed steering correction [-1 … +1].
-        Uses UNet + optional Canny fusion for better lane following.
+
+        Decision hierarchy:
+          1. CANNY (primary) — UltimateDynamicTracker computes the Point of
+             Orientation from sliding-window edge detection + PD controller.
+             The vehicle steers toward this point.
+          2. UNET (secondary) — only used as a safety check: if the UNet
+             mask shows a white border dangerously close to the lane centre
+             it triggers an emergency avoidance override.
+          3. If Canny is unavailable, UNet steers as a fallback.
+
         Returns 0.0 on any error.
         """
         if not self._ready or jpeg_bytes is None:
@@ -266,45 +265,37 @@ class LineFollower:
             if frame is None:
                 return 0.0
 
-            mask = self._get_mask(frame)
-            mask = self._clean_mask(mask)
-            roi_top = int(mask.shape[0] * ROI_TOP_FRAC)
-            roi = mask[roi_top:, :]
-            unet_raw = self._lane_gap_offset(roi)
-
-            # Canny = PRIMARY steering (points of orientation, edge centering)
-            # UNet  = SECONDARY validation (is this a drivable lane?)
-            canny_raw = 0.0
-            canny_available_now = False
+            # ── CANNY = PRIMARY: Point of Orientation steering ──
+            canny_steer = None
             if self._canny_available and self._canny_detector is not None:
                 try:
-                    h, w = frame.shape[:2]
-                    centers, lefts, rights, debug = self._canny_detector.detect(frame)
-                    steer, target, _ = self._canny_detector.compute_steering(centers, w, k_gain=1.0)
-                    if steer is not None:
-                        canny_raw = steer
-                        canny_available_now = True
+                    frame_resized = self._cv2.resize(frame, (640, 480))
+                    steer_val, _, _ = self._canny_detector.process_frame(frame_resized)
+                    canny_steer = float(steer_val)
                 except Exception as e:
                     logger.debug(f"Canny detection error: {e}")
 
-            if canny_available_now:
-                # Canny decides steering direction
-                raw = canny_raw
+            # ── UNET = SECONDARY: lane passability check only ──
+            unet_raw = 0.0
+            if self.model is not None:
+                mask = self._get_mask(frame)
+                mask = self._clean_mask(mask)
+                roi_top = int(mask.shape[0] * ROI_TOP_FRAC)
+                roi = mask[roi_top:, :]
+                unet_raw = self._lane_gap_offset(roi)
 
-                # UNet validates: if UNet strongly disagrees, the lane may not be drivable
-                # UNet large |correction| = heading toward white border
-                if abs(unet_raw) > 0.5 and (canny_raw * unet_raw) < 0:
-                    # Canny steers one way, UNet says white line is there → emergency
-                    if abs(unet_raw) > 0.7:
-                        raw = -0.6 * np.sign(unet_raw)  # avoid white line
-                        logger.warning(
-                            f"WHITE LINE AVOID: canny={canny_raw:+.3f} unet={unet_raw:+.3f} → {raw:+.3f}"
-                        )
-                    else:
-                        raw = 0.4 * canny_raw - 0.6 * unet_raw
-                elif abs(unet_raw) > 0.7:
-                    # No canny conflict but UNet sees imminent white line
-                    raw = 0.5 * canny_raw - 0.3 * np.sign(unet_raw)
+            # ── Decide final steering ──
+            if canny_steer is not None:
+                # Trust canny's Point of Orientation steering
+                raw = canny_steer
+
+                # UNet safety override: white border dangerously close
+                if abs(unet_raw) > 0.7:
+                    raw = -0.5 * np.sign(unet_raw)
+                    logger.warning(
+                        f"UNET EMERGENCY: white line near centre! "
+                        f"canny={canny_steer:+.3f} unet={unet_raw:+.3f} → override={raw:+.3f}"
+                    )
             else:
                 # Canny unavailable → fallback to UNet
                 raw = unet_raw
@@ -312,11 +303,11 @@ class LineFollower:
             # EMA smoothing
             self._ema_correction = EMA_ALPHA * raw + (1.0 - EMA_ALPHA) * self._ema_correction
 
-            if abs(canny_raw) > 0.01 or abs(unet_raw) > 0.01:
+            if abs(raw) > 0.01:
                 logger.debug(
-                    f"Lane: canny={canny_raw:+.3f} unet={unet_raw:+.3f} "
-                    f"raw={raw:+.3f} ema={self._ema_correction:+.3f} "
-                    f"canny_primary={canny_available_now}"
+                    f"Lane: canny={'N/A' if canny_steer is None else f'{canny_steer:+.3f}'} "
+                    f"unet={unet_raw:+.3f} raw={raw:+.3f} ema={self._ema_correction:+.3f} "
+                    f"primary={'canny' if canny_steer is not None else 'unet'}"
                 )
 
             return self._ema_correction
