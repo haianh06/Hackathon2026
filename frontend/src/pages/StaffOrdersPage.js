@@ -1,10 +1,10 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { getOrders, getPendingOrders, confirmOrder, cancelOrder, getMapPoints, getVehicleStatus, findPath } from '../services/api';
+import { getOrders, getPendingOrders, confirmOrder, cancelOrder, getMapPoints, getVehicleStatus, findPath, batchConfirmOrders } from '../services/api';
 import socket from '../services/socket';
 import DemoMap from '../components/DemoMap';
 import {
     CheckCircleIcon, TruckIcon, XCircleIcon, ClockIcon,
-    ArrowPathIcon, FunnelIcon, MapIcon
+    ArrowPathIcon, FunnelIcon, MapIcon, XMarkIcon
 } from '@heroicons/react/24/outline';
 
 const statusConfig = {
@@ -22,6 +22,12 @@ export default function StaffOrdersPage() {
     const [loading, setLoading] = useState(true);
     const [notification, setNotification] = useState(null);
     const [confirming, setConfirming] = useState(null);
+
+    // Multi-select state
+    const [selectedOrders, setSelectedOrders] = useState([]); // array of order IDs
+    const [showBatchModal, setShowBatchModal] = useState(false);
+    const [batchPath, setBatchPath] = useState(null); // full combined path for preview
+    const [batchConfirming, setBatchConfirming] = useState(false);
 
     // Map state
     const [mapPoints, setMapPoints] = useState([]);
@@ -158,6 +164,61 @@ export default function StaffOrdersPage() {
         }
     };
 
+    // Toggle order selection for batch
+    const toggleSelectOrder = (orderId) => {
+        setSelectedOrders(prev =>
+            prev.includes(orderId)
+                ? prev.filter(id => id !== orderId)
+                : [...prev, orderId]
+        );
+    };
+
+    // Open batch preview modal — compute combined route
+    const handleBatchPreview = async () => {
+        if (selectedOrders.length === 0) return;
+        setBatchConfirming(false);
+
+        // Get selected orders in selection order
+        const selected = selectedOrders.map(id => orders.find(o => o._id === id)).filter(Boolean);
+
+        // Build sequential path: S → dest1 → dest2 → ...
+        const fullPath = [];
+        let currentPoint = 'S';
+        try {
+            for (let i = 0; i < selected.length; i++) {
+                const res = await findPath(currentPoint, selected[i].destinationPoint);
+                const segment = res.data.data;
+                if (segment && segment.length >= 2) {
+                    const pts = i === 0 ? segment : segment.slice(1);
+                    fullPath.push(...pts);
+                    currentPoint = selected[i].destinationPoint;
+                }
+            }
+        } catch (e) {
+            console.error('Error computing batch path:', e);
+        }
+
+        setBatchPath(fullPath.length > 0 ? fullPath : null);
+        setShowBatchModal(true);
+    };
+
+    // Confirm batch
+    const handleBatchConfirm = async () => {
+        setBatchConfirming(true);
+        try {
+            await batchConfirmOrders(selectedOrders);
+            setNotification({ message: `Đã duyệt ${selectedOrders.length} đơn hàng! Xe bắt đầu giao.`, type: 'success' });
+            setSelectedOrders([]);
+            setShowBatchModal(false);
+            setBatchPath(null);
+            loadOrders();
+        } catch (err) {
+            setNotification({ message: 'Lỗi duyệt đơn hàng hàng loạt', type: 'error' });
+        } finally {
+            setBatchConfirming(false);
+        }
+    };
+
     const pendingCount = orders.filter(o => o.status === 'pending').length;
     const deliveringCount = orders.filter(o => o.status === 'delivering').length;
 
@@ -174,10 +235,28 @@ export default function StaffOrdersPage() {
             )}
 
             <div className="flex items-center justify-between mb-6">
-                <h1 className="text-2xl font-bold text-gray-900">Quản lý đơn hàng</h1>
-                <button onClick={loadOrders} className="inline-flex items-center gap-1.5 text-sm text-gray-500 hover:text-amber-600">
-                    <ArrowPathIcon className="w-4 h-4" /> Tải lại
-                </button>
+                <div className="flex items-center gap-3">
+                    <h1 className="text-2xl font-bold text-gray-900">Quản lý đơn hàng</h1>
+                    {selectedOrders.length > 0 && (
+                        <button
+                            onClick={handleBatchPreview}
+                            className="inline-flex items-center gap-1.5 px-4 py-2 bg-amber-500 text-white rounded-lg text-sm font-bold hover:bg-amber-600 transition shadow-lg animate-pulse"
+                        >
+                            <TruckIcon className="w-4 h-4" />
+                            Duyệt {selectedOrders.length} đơn
+                        </button>
+                    )}
+                </div>
+                <div className="flex items-center gap-2">
+                    {selectedOrders.length > 0 && (
+                        <button onClick={() => setSelectedOrders([])} className="text-sm text-gray-400 hover:text-gray-600">
+                            Bỏ chọn
+                        </button>
+                    )}
+                    <button onClick={loadOrders} className="inline-flex items-center gap-1.5 text-sm text-gray-500 hover:text-amber-600">
+                        <ArrowPathIcon className="w-4 h-4" /> Tải lại
+                    </button>
+                </div>
             </div>
 
             {/* Stats bar */}
@@ -230,17 +309,35 @@ export default function StaffOrdersPage() {
                         const isPending = order.status === 'pending';
                         const isDelivering = order.status === 'delivering' || order.status === 'confirmed';
                         const isArrived = order.status === 'arrived';
+                        const isSelected = selectedOrders.includes(order._id);
 
                         return (
-                            <div key={order._id} className={`bg-white rounded-xl border p-5 ${isPending ? 'border-yellow-300 ring-1 ring-yellow-100' : 'border-gray-200'}`}>
+                            <div
+                                key={order._id}
+                                className={`rounded-xl border p-5 transition-all cursor-pointer ${isSelected
+                                    ? 'bg-amber-50 border-amber-400 ring-2 ring-amber-200 shadow-lg'
+                                    : isPending
+                                        ? 'bg-white border-yellow-300 ring-1 ring-yellow-100'
+                                        : 'bg-white border-gray-200'
+                                    }`}
+                                onClick={() => { if (isPending) toggleSelectOrder(order._id); }}
+                            >
                                 <div className="flex items-start justify-between mb-3">
-                                    <div>
-                                        <p className="font-semibold text-gray-800">
-                                            {order.customerName || order.customer?.username || 'Khách hàng'}
-                                        </p>
-                                        <p className="text-xs text-gray-400">
-                                            #{order._id.slice(-6).toUpperCase()} &middot; {new Date(order.createdAt).toLocaleString('vi-VN')}
-                                        </p>
+                                    <div className="flex items-center gap-3">
+                                        {isPending && (
+                                            <div className={`w-5 h-5 rounded border-2 flex items-center justify-center flex-shrink-0 transition ${isSelected ? 'bg-amber-500 border-amber-500' : 'border-gray-300'
+                                                }`}>
+                                                {isSelected && <CheckCircleIcon className="w-4 h-4 text-white" />}
+                                            </div>
+                                        )}
+                                        <div>
+                                            <p className="font-semibold text-gray-800">
+                                                {order.customerName || order.customer?.username || 'Khách hàng'}
+                                            </p>
+                                            <p className="text-xs text-gray-400">
+                                                #{order._id.slice(-6).toUpperCase()} &middot; {new Date(order.createdAt).toLocaleString('vi-VN')}
+                                            </p>
+                                        </div>
                                     </div>
                                     <span className={`inline-flex items-center gap-1 text-xs font-medium px-2.5 py-1 rounded-full border ${cfg.color}`}>
                                         <Icon className="w-3.5 h-3.5" /> {cfg.label}
@@ -266,7 +363,7 @@ export default function StaffOrdersPage() {
                                 </div>
 
                                 {/* Action buttons */}
-                                <div className="flex gap-2 mt-4 pt-3 border-t">
+                                <div className="flex gap-2 mt-4 pt-3 border-t" onClick={e => e.stopPropagation()}>
                                     {isPending && (
                                         <button
                                             onClick={() => handleConfirm(order._id)}
@@ -277,7 +374,7 @@ export default function StaffOrdersPage() {
                                             ) : (
                                                 <TruckIcon className="w-4 h-4" />
                                             )}
-                                            Xác nhận & Giao hàng tự động
+                                            Xác nhận 1 đơn
                                         </button>
                                     )}
                                     {isArrived && (
@@ -332,6 +429,103 @@ export default function StaffOrdersPage() {
                             </div>
                         );
                     })}
+                </div>
+            )}
+
+            {/* Batch Confirm Modal */}
+            {showBatchModal && (
+                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm">
+                    <div className="bg-white rounded-2xl shadow-2xl w-full max-w-2xl mx-4 max-h-[90vh] overflow-y-auto">
+                        {/* Modal Header */}
+                        <div className="flex items-center justify-between px-6 py-4 border-b">
+                            <h2 className="text-lg font-bold text-gray-900 flex items-center gap-2">
+                                <TruckIcon className="w-5 h-5 text-amber-500" />
+                                Xác nhận giao {selectedOrders.length} đơn hàng
+                            </h2>
+                            <button onClick={() => setShowBatchModal(false)} className="p-1 rounded-lg hover:bg-gray-100">
+                                <XMarkIcon className="w-5 h-5 text-gray-400" />
+                            </button>
+                        </div>
+
+                        {/* Route info */}
+                        <div className="px-6 py-4 space-y-3">
+                            <div className="text-sm text-gray-600">
+                                <span className="font-medium">Thứ tự giao hàng:</span>
+                                <div className="flex items-center gap-1 mt-1 flex-wrap">
+                                    <span className="bg-green-100 text-green-700 px-2 py-0.5 rounded text-xs font-bold">S</span>
+                                    {selectedOrders.map((id, idx) => {
+                                        const o = orders.find(o => o._id === id);
+                                        return (
+                                            <React.Fragment key={id}>
+                                                <span className="text-gray-400">→</span>
+                                                <span className="bg-amber-100 text-amber-700 px-2 py-0.5 rounded text-xs font-bold">
+                                                    {o?.destinationPoint} <span className="font-normal text-gray-500">(#{id.slice(-4)})</span>
+                                                </span>
+                                            </React.Fragment>
+                                        );
+                                    })}
+                                </div>
+                            </div>
+
+                            {/* Selected orders summary */}
+                            <div className="space-y-2">
+                                {selectedOrders.map((id, idx) => {
+                                    const o = orders.find(o => o._id === id);
+                                    if (!o) return null;
+                                    return (
+                                        <div key={id} className="flex items-center gap-3 bg-gray-50 rounded-lg p-3 text-sm">
+                                            <span className="w-6 h-6 bg-amber-500 text-white rounded-full flex items-center justify-center text-xs font-bold flex-shrink-0">{idx + 1}</span>
+                                            <div className="flex-1 min-w-0">
+                                                <span className="font-medium text-gray-800">{o.customerName || o.customer?.username}</span>
+                                                <span className="text-gray-400 mx-2">·</span>
+                                                <span className="text-gray-500">#{id.slice(-6).toUpperCase()}</span>
+                                            </div>
+                                            <span className="text-xs font-bold text-blue-600">{o.destinationPoint}</span>
+                                            <span className="text-xs font-bold text-amber-600">{o.totalPrice?.toLocaleString('vi-VN')}đ</span>
+                                        </div>
+                                    );
+                                })}
+                            </div>
+
+                            {/* Map preview */}
+                            {mapPoints.length > 0 && (
+                                <div className="bg-gray-50 rounded-xl p-3 border border-gray-100">
+                                    <DemoMap
+                                        points={mapPoints}
+                                        vehiclePosition="S"
+                                        activePath={batchPath}
+                                    />
+                                    {batchPath && (
+                                        <div className="mt-2 text-xs text-gray-500 text-center">
+                                            Tuyến: {batchPath.map(p => p.pointId).join(' → ')}
+                                        </div>
+                                    )}
+                                </div>
+                            )}
+                        </div>
+
+                        {/* Modal Footer */}
+                        <div className="flex gap-3 px-6 py-4 border-t bg-gray-50 rounded-b-2xl">
+                            <button
+                                onClick={() => setShowBatchModal(false)}
+                                className="flex-1 px-4 py-2.5 bg-gray-200 text-gray-700 rounded-lg text-sm font-medium hover:bg-gray-300 transition"
+                            >
+                                Huỷ bỏ
+                            </button>
+                            <button
+                                onClick={handleBatchConfirm}
+                                disabled={batchConfirming}
+                                className="flex-1 inline-flex items-center justify-center gap-2 px-4 py-2.5 bg-amber-500 text-white rounded-lg text-sm font-bold hover:bg-amber-600 disabled:opacity-50 transition shadow-lg"
+                            >
+                                {batchConfirming ? (
+                                    <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                                ) : (
+                                    <TruckIcon className="w-4 h-4" />
+                                )}
+                                Xác nhận & Giao hàng
+                            </button>
+                        </div>
+                    </div>
                 </div>
             )}
         </div>

@@ -21,6 +21,10 @@ const vehicleSchema = new mongoose.Schema({
         ref: 'Order',
         default: null
     },
+    heading: {
+        type: [Number],
+        default: null
+    },
     batteryLevel: {
         type: Number,
         default: 100

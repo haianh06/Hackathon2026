@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { BellIcon, CheckIcon, XMarkIcon } from '@heroicons/react/24/outline';
 import { BellAlertIcon } from '@heroicons/react/24/solid';
 import { getNotifications, getUnreadNotificationCount, markNotificationRead, markAllNotificationsRead } from '../services/api';
@@ -14,6 +15,7 @@ const typeConfig = {
 };
 
 export default function NotificationBell() {
+    const navigate = useNavigate();
     const [open, setOpen] = useState(false);
     const [notifications, setNotifications] = useState([]);
     const [unreadCount, setUnreadCount] = useState(0);
@@ -140,7 +142,13 @@ export default function NotificationBell() {
                                     <div
                                         key={notif._id}
                                         className={`px-4 py-3 hover:bg-gray-50 transition cursor-pointer ${!notif.read ? 'bg-blue-50/50' : ''}`}
-                                        onClick={() => !notif.read && handleMarkRead(notif._id)}
+                                        onClick={() => {
+                                            if (!notif.read) handleMarkRead(notif._id);
+                                            if (['order_arrived', 'order_confirmed', 'order_delivered'].includes(notif.type)) {
+                                                setOpen(false);
+                                                navigate('/my-orders');
+                                            }
+                                        }}
                                     >
                                         <div className="flex items-start gap-2.5">
                                             <span className="text-lg mt-0.5">{cfg.emoji}</span>

@@ -47,6 +47,15 @@ function setupSocket(io) {
         socket.on('navigation-complete', async (data) => {
             io.emit('navigation-complete', data);
 
+            // Save vehicle heading for next navigation
+            if (data.heading) {
+                try {
+                    await vehicleService.updateHeading(data.heading);
+                } catch (err) {
+                    console.error('Error saving vehicle heading:', err);
+                }
+            }
+
             // Check if this is a delivery completion (not a return trip)
             if (data.orderId && !data.isReturn) {
                 try {

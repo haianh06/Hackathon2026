@@ -34,7 +34,8 @@ RUN python3 -m venv --system-site-packages /app/hardware/venv && \
     "numpy>=1.24.0"
 
 # PyTorch (CPU-only) — use --extra-index-url so PyPI stays available as fallback
-RUN /app/hardware/venv/bin/pip install --no-cache-dir \
+# timeout 600s for large wheel on slow networks (146MB on aarch64)
+RUN /app/hardware/venv/bin/pip install --no-cache-dir --timeout 600 --retries 5 \
     "torch>=2.0.0" --extra-index-url https://download.pytorch.org/whl/cpu
 
 # Copy U-Net model weights for line-following

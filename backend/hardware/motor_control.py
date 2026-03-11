@@ -308,6 +308,15 @@ class AutoNavigator:
 
     # ── Public API ──────────────────────────────────────────
 
+    def set_heading(self, heading):
+        """Set the vehicle heading (e.g. restored from server after restart).
+        heading: [dx, dy] list/tuple or None."""
+        if heading and len(heading) == 2:
+            self.heading = (int(heading[0]), int(heading[1]))
+            logger.info(f"AutoNavigator: heading set to {self.heading}")
+        else:
+            logger.info(f"AutoNavigator: heading not set (value={heading})")
+
     async def navigate_path(self, path, emit_cb):
         """
         Navigate *path* (list of dicts with pointId, x, y).
@@ -318,122 +327,125 @@ class AutoNavigator:
             return
 
         self.navigating = True
-        self.heading = None
+        # NOTE: Do NOT reset self.heading here.
+        # The heading persists between navigations so the vehicle
+        # knows its current facing direction and can U-turn if the
+        # next path starts in the opposite direction.
         start_time = time.time()
         point_ids = [p.get('pointId', '?') for p in path]
 
-        logger.info(f"▶ AUTO-NAV START  path={point_ids}")
+        logger.info(f"▶ AUTO-NAV START  path={point_ids}  initial_heading={self.heading}")
         await emit_cb('navigation-log', {
             'type': 'start',
             'pointId': path[0]['pointId'],
             'x': path[0]['x'], 'y': path[0]['y'],
+            'heading': list(self.heading) if self.heading else None,
             'timestamp': start_time,
             'route': point_ids,
         })
 
-        for i in range(len(path) - 1):
-            if not self.navigating:
-                logger.info("⏹ Navigation cancelled mid-route")
-                break
+        try:
+            for i in range(len(path) - 1):
+                if not self.navigating:
+                    logger.info("⏹ Navigation cancelled mid-route")
+                    break
 
-            cur  = path[i]
-            nxt  = path[i + 1]
-            dx   = nxt['x'] - cur['x']
-            dy   = nxt['y'] - cur['y']
-            dist = math.sqrt(dx * dx + dy * dy)
-            target = (_sign(dx), _sign(dy))
+                cur  = path[i]
+                nxt  = path[i + 1]
+                dx   = nxt['x'] - cur['x']
+                dy   = nxt['y'] - cur['y']
+                dist = math.sqrt(dx * dx + dy * dy)
+                target = (_sign(dx), _sign(dy))
 
-            # ── Turn at intersection ──
-            if self.heading is not None and self.heading != target:
-                turn = self._calc_turn(self.heading, target)
-                await self._exec_turn(turn)
+                # ── Turn at intersection ──
+                if self.heading is not None and self.heading != target:
+                    turn = self._calc_turn(self.heading, target)
+                    await self._exec_turn(turn)
 
-            self.heading = target
+                self.heading = target
 
-            # ── Drive forward with continuous differential steering ──
-            drive_sec = dist * self.DRIVE_TIME_PER_PIXEL
-            logger.info(
-                f"  ➜ {cur['pointId']} → {nxt['pointId']}  "
-                f"dist={dist:.0f}px  drive={drive_sec:.2f}s  heading={self.heading}"
-            )
+                # ── Drive forward with continuous differential steering ──
+                drive_sec = dist * self.DRIVE_TIME_PER_PIXEL
+                logger.info(
+                    f"  ➜ {cur['pointId']} → {nxt['pointId']}  "
+                    f"dist={dist:.0f}px  drive={drive_sec:.2f}s  heading={self.heading}"
+                )
 
-            # Reset line-follower EMA state for new segment
-            if self._line_follower and hasattr(self._line_follower, 'reset'):
-                self._line_follower.reset()
-            self._prev_correction = 0.0
-            self._stuck_counter = 0
-            self._stuck_sign = 0
+                # Reset line-follower EMA state for new segment
+                if self._line_follower and hasattr(self._line_follower, 'reset'):
+                    self._line_follower.reset()
+                self._prev_correction = 0.0
+                self._stuck_counter = 0
+                self._stuck_sign = 0
 
-            self.motor.forward()
+                self.motor.forward()
 
-            # Report interpolated positions during drive
-            elapsed = 0.0
-            while elapsed < drive_sec and self.navigating:
-                step = min(self.LINE_FOLLOW_INTERVAL, drive_sec - elapsed)
-                await asyncio.sleep(step)
-                elapsed += step
+                # Report interpolated positions during drive
+                # Use wall-clock time so camera/model processing time counts
+                segment_start = time.time()
+                while (time.time() - segment_start) < drive_sec and self.navigating:
+                    await asyncio.sleep(self.LINE_FOLLOW_INTERVAL)
+                    elapsed = time.time() - segment_start
 
-                # ── Camera line-following with PD control + differential steering ──
-                correction = await self._get_line_correction()
-                if abs(correction) >= self.LINE_FOLLOW_THRESHOLD:
-                    # PD controller
-                    derivative = correction - self._prev_correction
-                    steer = (self.LINE_FOLLOW_GAIN * correction +
-                             self.LINE_FOLLOW_D_GAIN * derivative)
-                    steer = max(-1.0, min(1.0, steer))
+                    # ── Camera line-following with PD control + differential steering ──
+                    correction = await self._get_line_correction()
+                    if abs(correction) >= self.LINE_FOLLOW_THRESHOLD:
+                        # PD controller
+                        derivative = correction - self._prev_correction
+                        steer = (self.LINE_FOLLOW_GAIN * correction +
+                                 self.LINE_FOLLOW_D_GAIN * derivative)
+                        steer = max(-1.0, min(1.0, steer))
 
-                    # Apply differential steering (no stop-turn-resume!)
-                    self.motor.forward_steer(steer)
+                        # Apply differential steering (no stop-turn-resume!)
+                        self.motor.forward_steer(steer)
 
-                    # Stuck detection
-                    corr_sign = 1 if correction > 0 else -1
-                    if (corr_sign == self._stuck_sign and
-                            abs(correction) >= self.STUCK_MIN_MAGNITUDE):
-                        self._stuck_counter += 1
-                    else:
-                        self._stuck_counter = 0
-                        self._stuck_sign = corr_sign
-
-                    if self._stuck_counter >= self.STUCK_CONSECUTIVE_LIMIT:
-                        # Servo likely stuck — aggressive opposite correction
-                        logger.warning(f"  ⚠ STUCK detected ({self._stuck_counter} frames), "
-                                       f"aggressive reverse steer")
-                        self.motor.stop()
-                        await asyncio.sleep(0.1)
-                        # Brief hard opposite turn
-                        if correction > 0:
-                            self.motor.turn_left()
+                        # Stuck detection
+                        corr_sign = 1 if correction > 0 else -1
+                        if (corr_sign == self._stuck_sign and
+                                abs(correction) >= self.STUCK_MIN_MAGNITUDE):
+                            self._stuck_counter += 1
                         else:
-                            self.motor.turn_right()
-                        await asyncio.sleep(0.25)
-                        self.motor.forward()
-                        self._stuck_counter = 0
+                            self._stuck_counter = 0
+                            self._stuck_sign = corr_sign
+
+                        if self._stuck_counter >= self.STUCK_CONSECUTIVE_LIMIT:
+                            # Servo likely stuck — aggressive opposite correction
+                            logger.warning(f"  ⚠ STUCK detected ({self._stuck_counter} frames), "
+                                           f"aggressive reverse steer")
+                            self.motor.stop()
+                            await asyncio.sleep(0.1)
+                            # Brief hard opposite turn
+                            if correction > 0:
+                                self.motor.turn_left()
+                            else:
+                                self.motor.turn_right()
+                            await asyncio.sleep(0.25)
+                            self.motor.forward()
+                            self._stuck_counter = 0
+                            await emit_cb('navigation-log', {
+                                'type': 'stuck-recovery',
+                                'correction': round(correction, 3),
+                                'timestamp': time.time(),
+                            })
+
+                        logger.debug(f"    🔧 steer {steer:+.3f} (P={correction:+.3f} D={derivative:+.3f})")
                         await emit_cb('navigation-log', {
-                            'type': 'stuck-recovery',
+                            'type': 'line-correct',
                             'correction': round(correction, 3),
+                            'steer': round(steer, 3),
                             'timestamp': time.time(),
                         })
+                    else:
+                        # Centered — drive straight
+                        self.motor.forward()
+                        self._stuck_counter = 0
 
-                    logger.debug(f"    🔧 steer {steer:+.3f} (P={correction:+.3f} D={derivative:+.3f})")
-                    await emit_cb('navigation-log', {
-                        'type': 'line-correct',
-                        'correction': round(correction, 3),
-                        'steer': round(steer, 3),
-                        'timestamp': time.time(),
-                    })
-                else:
-                    # Centered — drive straight
-                    self.motor.forward()
-                    self._stuck_counter = 0
+                    self._prev_correction = correction
 
-                self._prev_correction = correction
-
-                # ── Position report at POSITION_REPORT_INTERVAL cadence ──
-                progress = min(elapsed / drive_sec, 1.0)
-                ix = cur['x'] + dx * progress
-                iy = cur['y'] + dy * progress
-                # Only emit position at the report interval
-                if elapsed == step or int(elapsed / self.POSITION_REPORT_INTERVAL) != int((elapsed - step) / self.POSITION_REPORT_INTERVAL) or progress >= 1.0:
+                    # ── Position report at POSITION_REPORT_INTERVAL cadence ──
+                    progress = min(elapsed / drive_sec, 1.0)
+                    ix = cur['x'] + dx * progress
+                    iy = cur['y'] + dy * progress
                     await emit_cb('navigation-log', {
                         'type': 'moving',
                         'x': round(ix, 1),
@@ -444,43 +456,49 @@ class AutoNavigator:
                         'timestamp': time.time(),
                     })
 
+                self.motor.stop()
+                await asyncio.sleep(0.20)
+
+                # ── Drift correction at waypoint ──
+                if i < len(path) - 2:
+                    next_dx = path[i + 2]['x'] - nxt['x']
+                    next_dy = path[i + 2]['y'] - nxt['y']
+                    next_target = (_sign(next_dx), _sign(next_dy))
+                    if next_target != target:
+                        # Approaching a turn — add micro-correction
+                        await self._drift_correct(target, next_target)
+
+                # ── Report waypoint reached ──
+                logger.info(f"  ✔ Reached {nxt['pointId']} ({nxt['x']},{nxt['y']}) heading={self.heading}")
+                await emit_cb('navigation-log', {
+                    'type': 'waypoint',
+                    'pointId': nxt['pointId'],
+                    'x': nxt['x'], 'y': nxt['y'],
+                    'heading': list(self.heading) if self.heading else None,
+                    'timestamp': time.time(),
+                })
+                await emit_cb('vehicle-position-update', {'pointId': nxt['pointId']})
+
+        finally:
+            # ALWAYS stop motor — prevents servo spinning forever on any error
             self.motor.stop()
-            await asyncio.sleep(0.20)
-
-            # ── Drift correction at waypoint ──
-            if i < len(path) - 2:
-                next_dx = path[i + 2]['x'] - nxt['x']
-                next_dy = path[i + 2]['y'] - nxt['y']
-                next_target = (_sign(next_dx), _sign(next_dy))
-                if next_target != target:
-                    # Approaching a turn — add micro-correction
-                    await self._drift_correct(target, next_target)
-
-            # ── Report waypoint reached ──
-            logger.info(f"  ✔ Reached {nxt['pointId']} ({nxt['x']},{nxt['y']})")
-            await emit_cb('navigation-log', {
-                'type': 'waypoint',
-                'pointId': nxt['pointId'],
-                'x': nxt['x'], 'y': nxt['y'],
-                'timestamp': time.time(),
-            })
-            await emit_cb('vehicle-position-update', {'pointId': nxt['pointId']})
+            self.navigating = False
 
         # ── Done ──
-        self.motor.stop()
         end_time = time.time()
         duration = round(end_time - start_time, 2)
-        logger.info(f"■ AUTO-NAV COMPLETE  duration={duration}s")
+        heading_list = list(self.heading) if self.heading else None
+        logger.info(f"■ AUTO-NAV COMPLETE  duration={duration}s  heading={self.heading}")
         await emit_cb('navigation-log', {
             'type': 'complete',
             'pointId': path[-1]['pointId'],
             'x': path[-1]['x'], 'y': path[-1]['y'],
+            'heading': heading_list,
             'startTime': start_time,
             'endTime': end_time,
             'duration': duration,
             'timestamp': end_time,
         })
-        self.navigating = False
 
     def stop_navigation(self):
         """Cancel ongoing navigation."""

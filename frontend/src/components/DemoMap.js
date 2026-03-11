@@ -1,84 +1,37 @@
 import React, { useRef, useEffect, useState, useCallback } from 'react';
 
 /*
- * Map layout matching the physical track (portrait orientation):
+ * Map layout — single-lane grid (portrait orientation):
  *
- *   TL ───→──── B ───→──── S       Row 0 (top, → right)
- *   │    ╔════════════════╗   │
- *   ↑    ║  Building (B)  ║   ↓    (purple border)
- *   │    ╚════════════════╝   │
- *   P1 ──←──── P2 ──←──── P3      Row 1 (← left)
- *   │  ═══════ barrier ═══════ │
- *   P4 ──→──── P5 ──→──── R1      Row 2 (→ right)
- *   │   [bld]  ┃│┃  [bld]    │
- *   ↑     ↓    ┃│┃    ↑      ↓    (center: two-way ↕)
- *   │   [bld]  ┃│┃  [bld]    │
- *   A  ──←──── P6 ──←──── C       Row 3 (← left)
- *   │  ═══════ barrier ═══════ │
- *   P7 ──→──── P8 ──→──── P9      Row 4 (→ right)
- *   │   [bld]        [bld]    │
- *   ↑      ↕ free ↕           ↓
- *   │   [bld]        [bld]    │
- *   ST ──←──── P10 ─←──── P11     Row 5 (← left)
+ *   TL ─ ─ ─ ─ B ─ ─ ─ ─ S       Row 0 (top)
+ *   │     ┌───────────┐     │
+ *   │     │ Building B │     │
+ *   │     └───────────┘     │
+ *   P1 ─ ─ ─ P2 ─ ─ ─ ─ P3      Row 1
+ *   │  [bld]   │   [bld]    │
+ *   │          │             │
+ *   A ─ ─ ─ ─ P4 ─ ─ ─ ─  C      Row 2
+ *   │  [bld]   │   [bld]    │
+ *   │          │             │
+ *   ST ─ ─ ─  P5 ─ ─ ─ ─ P6      Row 3 (bottom)
  *
- *   ↑ left (one-way up)  |  ↓ right (one-way down)
- *   Bottom buildings: free two-way (no arrows)
+ *   All roads are single-lane, bidirectional (free movement).
+ *   Dashed lines (─ ─) indicate road markings.
+ *   White blocks [bld] are buildings.
  */
 
 // Buildings (white rounded-rect areas)
 const OBSTACLES = [
     // Large top building with purple border (destination B area)
-    { x: 110, y: 60, w: 380, h: 105, purpleBorder: true },
-    // Middle-left building (between Row 2 and Row 3)
-    { x: 110, y: 305, w: 130, h: 75 },
-    // Middle-right building (between Row 2 and Row 3)
-    { x: 360, y: 305, w: 130, h: 75 },
-    // Bottom-left building (between Row 4 and Row 5)
-    { x: 110, y: 535, w: 130, h: 88 },
-    // Bottom-right building (between Row 4 and Row 5)
-    { x: 360, y: 535, w: 130, h: 88 },
-];
-
-// Horizontal barrier lines (lane dividers for two-way roads)
-// Gaps at x<110 and x>490 allow left/right side roads to pass through
-const BARRIERS = [
-    { y: 235, xStart: 110, xEnd: 490 },
-    { y: 450, xStart: 110, xEnd: 490 },
-];
-
-// Center vertical wall (median divider between middle buildings)
-const CENTER_WALL = { x: 300, y1: 310, y2: 370 };
-
-// Road arrow rules per segment
-const ROAD_ARROWS = [
-    // Outer perimeter — one-way clockwise
-    { from: 'TL', to: 'B', type: 'one-way' },      // top →
-    { from: 'B', to: 'S', type: 'one-way' },        // top →
-    { from: 'S', to: 'P3', type: 'one-way' },       // right ↓
-    { from: 'P3', to: 'R1', type: 'one-way' },      // right ↓
-    { from: 'R1', to: 'C', type: 'one-way' },       // right ↓
-    { from: 'C', to: 'P9', type: 'one-way' },       // right ↓
-    { from: 'P9', to: 'P11', type: 'one-way' },     // right ↓
-    { from: 'P11', to: 'P10', type: 'one-way' },    // bottom ←
-    { from: 'P10', to: 'ST', type: 'one-way' },     // bottom ←
-    { from: 'ST', to: 'P7', type: 'one-way' },      // left ↑
-    { from: 'P7', to: 'A', type: 'one-way' },       // left ↑
-    { from: 'A', to: 'P4', type: 'one-way' },       // left ↑
-    { from: 'P4', to: 'P1', type: 'one-way' },      // left ↑
-    { from: 'P1', to: 'TL', type: 'one-way' },      // left ↑
-    // Inner horizontal roads (two-way system separated by barriers)
-    { from: 'P3', to: 'P2', type: 'one-way' },      // Row 1 ←
-    { from: 'P2', to: 'P1', type: 'one-way' },      // Row 1 ←
-    { from: 'P4', to: 'P5', type: 'one-way' },      // Row 2 →
-    { from: 'P5', to: 'R1', type: 'one-way' },      // Row 2 →
-    { from: 'C', to: 'P6', type: 'one-way' },       // Row 3 ←
-    { from: 'P6', to: 'A', type: 'one-way' },       // Row 3 ←
-    { from: 'P7', to: 'P8', type: 'one-way' },      // Row 4 →
-    { from: 'P8', to: 'P9', type: 'one-way' },      // Row 4 →
-    // Center vertical — two-way (between middle buildings)
-    { from: 'P5', to: 'P6', type: 'two-way' },      // ↕
-    // Bottom center — free two-way (no arrows, between bottom buildings)
-    { from: 'P8', to: 'P10', type: 'free' },        // ↕
+    { x: 110, y: 80, w: 380, h: 125, purpleBorder: true },
+    // Middle-left building (between Row 1 and Row 2)
+    { x: 100, y: 270, w: 145, h: 115 },
+    // Middle-right building (between Row 1 and Row 2)
+    { x: 355, y: 270, w: 145, h: 115 },
+    // Bottom-left building (between Row 2 and Row 3)
+    { x: 100, y: 455, w: 145, h: 130 },
+    // Bottom-right building (between Row 2 and Row 3)
+    { x: 355, y: 455, w: 145, h: 130 },
 ];
 
 const POINT_COLORS = {
@@ -105,28 +58,7 @@ function DemoMap({ points, vehiclePosition, activePath, livePos }) {
         ctx.fillStyle = '#8e8e8e';
         ctx.fillRect(0, 0, W, H);
 
-        // ── 2. Arrow helper ──
-        const drawArrow = (startX, startY, endX, endY, color = '#ffffff', lineWidth = 2.5) => {
-            const headlen = 14;
-            const dx = endX - startX;
-            const dy = endY - startY;
-            const angle = Math.atan2(dy, dx);
-            ctx.beginPath();
-            ctx.moveTo(startX, startY);
-            ctx.lineTo(endX, endY);
-            ctx.strokeStyle = color;
-            ctx.lineWidth = lineWidth;
-            ctx.stroke();
-            ctx.beginPath();
-            ctx.moveTo(endX, endY);
-            ctx.lineTo(endX - headlen * Math.cos(angle - Math.PI / 6), endY - headlen * Math.sin(angle - Math.PI / 6));
-            ctx.lineTo(endX - headlen * Math.cos(angle + Math.PI / 6), endY - headlen * Math.sin(angle + Math.PI / 6));
-            ctx.lineTo(endX, endY);
-            ctx.fillStyle = color;
-            ctx.fill();
-        };
-
-        // ── 3. Buildings (white rounded rectangles) ──
+        // ── 2. Buildings (white rounded rectangles) ──
         OBSTACLES.forEach(obs => {
             ctx.fillStyle = 'rgba(0,0,0,0.12)';
             ctx.beginPath();
@@ -145,49 +77,7 @@ function DemoMap({ points, vehiclePosition, activePath, livePos }) {
             }
         });
 
-        // ── 4. Barrier lines (black horizontal lane dividers) ──
-        BARRIERS.forEach(bar => {
-            ctx.strokeStyle = '#333';
-            ctx.lineWidth = 4;
-            ctx.lineCap = 'round';
-            ctx.beginPath();
-            ctx.moveTo(bar.xStart, bar.y);
-            ctx.lineTo(bar.xEnd, bar.y);
-            ctx.stroke();
-        });
-
-        // ── 5. Center vertical wall (median between middle buildings) ──
-        ctx.strokeStyle = '#333';
-        ctx.lineWidth = 4;
-        ctx.lineCap = 'round';
-        ctx.beginPath();
-        ctx.moveTo(CENTER_WALL.x, CENTER_WALL.y1);
-        ctx.lineTo(CENTER_WALL.x, CENTER_WALL.y2);
-        ctx.stroke();
-
-        // ── 6. Direction arrows on roads ──
-        // Top road (→)
-        drawArrow(200, 18, 380, 18);
-        // Below building (←)
-        drawArrow(395, 210, 205, 210);
-        // Left side outer (↑)
-        drawArrow(35, 420, 35, 260);
-        // Right side outer (↓)
-        drawArrow(565, 240, 565, 405);
-        // Upper corridor (→)
-        drawArrow(200, 258, 370, 258);
-        // Center left of wall ↓
-        drawArrow(268, 312, 268, 370);
-        // Center right of wall ↑
-        drawArrow(332, 370, 332, 312);
-        // Lower corridor (←)
-        drawArrow(395, 425, 205, 425);
-        // Below lower barrier (→)
-        drawArrow(200, 475, 370, 475);
-        // Bottom road (←)
-        drawArrow(395, 682, 205, 682);
-
-        // ── 7. Points and interactive elements ──
+        // ── 3. Points and interactive elements ──
         if (!points || points.length === 0) {
             ctx.fillStyle = '#fff';
             ctx.font = '16px "Segoe UI", sans-serif';
@@ -199,7 +89,7 @@ function DemoMap({ points, vehiclePosition, activePath, livePos }) {
         const pointMap = {};
         points.forEach(p => { pointMap[p.pointId] = p; });
 
-        // ── Road connections (subtle overlay lines) ──
+        // ── Road connections (dashed lane markings) ──
         const drawnEdges = new Set();
         points.forEach(point => {
             (point.connections || []).forEach(connId => {
@@ -208,13 +98,25 @@ function DemoMap({ points, vehiclePosition, activePath, livePos }) {
                 drawnEdges.add(ek);
                 const t = pointMap[connId];
                 if (!t) return;
-                ctx.strokeStyle = 'rgba(255,255,255,0.18)';
-                ctx.lineWidth = 22;
+                // Road surface strip
+                ctx.strokeStyle = 'rgba(255,255,255,0.13)';
+                ctx.lineWidth = 26;
                 ctx.lineCap = 'round';
+                ctx.setLineDash([]);
                 ctx.beginPath();
                 ctx.moveTo(point.x, point.y);
                 ctx.lineTo(t.x, t.y);
                 ctx.stroke();
+                // Dashed center line
+                ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+                ctx.lineWidth = 2;
+                ctx.setLineDash([14, 10]);
+                ctx.lineCap = 'butt';
+                ctx.beginPath();
+                ctx.moveTo(point.x, point.y);
+                ctx.lineTo(t.x, t.y);
+                ctx.stroke();
+                ctx.setLineDash([]);
             });
         });
 

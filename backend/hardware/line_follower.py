@@ -286,7 +286,10 @@ class LineFollower:
 
             # ── Decide final steering ──
             if canny_steer is not None:
-                # Trust canny's Point of Orientation steering
+                # Trust canny's Point of Orientation steering directly.
+                # Canny already applies its own PD controller + EMA filter,
+                # so we do NOT apply additional EMA smoothing here to avoid
+                # double-smoothing which causes sluggish response.
                 raw = canny_steer
 
                 # UNet safety override: white border dangerously close
@@ -296,17 +299,18 @@ class LineFollower:
                         f"UNET EMERGENCY: white line near centre! "
                         f"canny={canny_steer:+.3f} unet={unet_raw:+.3f} → override={raw:+.3f}"
                     )
-            else:
-                # Canny unavailable → fallback to UNet
-                raw = unet_raw
 
-            # EMA smoothing
-            self._ema_correction = EMA_ALPHA * raw + (1.0 - EMA_ALPHA) * self._ema_correction
+                # No extra EMA — canny output is already smoothed
+                self._ema_correction = raw
+            else:
+                # Canny unavailable → fallback to UNet with EMA smoothing
+                raw = unet_raw
+                self._ema_correction = EMA_ALPHA * raw + (1.0 - EMA_ALPHA) * self._ema_correction
 
             if abs(raw) > 0.01:
                 logger.debug(
                     f"Lane: canny={'N/A' if canny_steer is None else f'{canny_steer:+.3f}'} "
-                    f"unet={unet_raw:+.3f} raw={raw:+.3f} ema={self._ema_correction:+.3f} "
+                    f"unet={unet_raw:+.3f} raw={raw:+.3f} final={self._ema_correction:+.3f} "
                     f"primary={'canny' if canny_steer is not None else 'unet'}"
                 )
 

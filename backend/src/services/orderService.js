@@ -108,6 +108,14 @@ class OrderService {
             .sort({ createdAt: -1 });
     }
 
+    async getNextBatchOrder(batchId, currentBatchOrder) {
+        return await Order.findOne({
+            batchId,
+            batchOrder: { $gt: currentBatchOrder },
+            status: { $in: ['confirmed', 'delivering'] }
+        }).sort({ batchOrder: 1 });
+    }
+
     async cancelOrder(id) {
         const order = await Order.findByIdAndUpdate(
             id,

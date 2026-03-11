@@ -54,6 +54,14 @@ const orderSchema = new mongoose.Schema({
     note: {
         type: String,
         default: ''
+    },
+    batchId: {
+        type: String,
+        default: null
+    },
+    batchOrder: {
+        type: Number,
+        default: 0
     }
 }, { timestamps: true });
 

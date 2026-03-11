@@ -21,6 +21,24 @@ class VehicleService {
         );
     }
 
+    async updateHeading(heading) {
+        return await Vehicle.findOneAndUpdate(
+            { vehicleId: 'VEHICLE_01' },
+            { heading },
+            { new: true }
+        );
+    }
+
+    async updatePositionAndHeading(pointId, heading) {
+        const update = { currentPosition: pointId };
+        if (heading) update.heading = heading;
+        return await Vehicle.findOneAndUpdate(
+            { vehicleId: 'VEHICLE_01' },
+            update,
+            { new: true }
+        );
+    }
+
     async updateStatus(status) {
         return await Vehicle.findOneAndUpdate(
             { vehicleId: 'VEHICLE_01' },
@@ -56,7 +74,8 @@ class VehicleService {
             { vehicleId: 'VEHICLE_01' },
             {
                 status: 'idle',
-                currentPosition: 'S'
+                currentPosition: 'S',
+                heading: null
             },
             { new: true }
         );

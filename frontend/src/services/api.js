@@ -45,6 +45,7 @@ export const getOrders = () => api.get('/orders');
 export const getMyOrders = () => api.get('/orders/my');
 export const getPendingOrders = () => api.get('/orders/pending');
 export const confirmOrder = (id) => api.put(`/orders/${id}/confirm`);
+export const batchConfirmOrders = (orderIds) => api.post('/orders/batch-confirm', { orderIds });
 export const markDelivered = (id) => api.put(`/orders/${id}/delivered`);
 export const customerConfirmOrder = (id) => api.put(`/orders/${id}/customer-confirm`);
 export const cancelOrder = (id) => api.put(`/orders/${id}/cancel`);

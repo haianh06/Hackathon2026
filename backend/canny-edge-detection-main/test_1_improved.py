@@ -22,20 +22,18 @@ class UltimateDynamicTracker:
         self.w = width
         self.h = height
         
-        self.y_bottom = int(self.h * 0.90)  # Đẩy lên một chút để tránh dính mũi xe/bóng râm
+        self.y_bottom = int(self.h * 0.90)  
         self.y_top = int(self.h * 0.55)
+        self.num_scans = 10  # Số lượng đường cắt ngang để vẽ thang
         
-        self.default_lane_width = int(self.w * 0.6)
-        self.lane_width_history = deque(maxlen=30)
-        
-        # Vị trí kỳ vọng ban đầu cho thuật toán Cửa sổ trượt (Sliding Window)
+        # Vị trí kỳ vọng tâm của vạch trắng (Ban đầu)
         self.l_bot_exp = int(self.w * 0.15)
         self.r_bot_exp = int(self.w * 0.85)
         self.l_top_exp = int(self.w * 0.35)
         self.r_top_exp = int(self.w * 0.65)
         
-        # Hình thang dự phòng chuẩn xác
-        self.prev_src_pts = np.float32([
+        # HÌNH THANG ROI ẢO (Dự phòng) - Lưu trữ 4 góc của hình thang lý tưởng
+        self.virtual_roi_pts = np.float32([
             [self.l_bot_exp, self.y_bottom], [self.r_bot_exp, self.y_bottom],
             [self.l_top_exp, self.y_top], [self.r_top_exp, self.y_top]
         ])
@@ -43,159 +41,167 @@ class UltimateDynamicTracker:
         self.Kp = 0.85
         self.Kd = 0.60
         self.steer_ema = EMAFilter(alpha=0.3)
+        self.roi_alpha = 0.2 
 
-    # ==========================================
-    # CẢI TIẾN 1: TÁCH NỀN SIÊU SẠCH (Từ phiên bản của bạn)
-    # ==========================================
     def _get_clean_mask(self, bgr_img: np.ndarray) -> np.ndarray:
-        """Chỉ tập trung bắt màu sáng/trắng, loại bỏ nhiễu Canny rối rắm"""
         gray = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2GRAY)
         blur = cv2.GaussianBlur(gray, (5, 5), 0)
-        
-        # Lọc nhị phân: Chỉ giữ lại các pixel cực sáng (vạch trắng). 
-        # LƯU Ý: Có thể chỉnh 180 tùy độ sáng môi trường.
         _, mask = cv2.threshold(blur, 180, 255, cv2.THRESH_BINARY)
-        
-        # Xóa các đốm nhiễu nhỏ
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        
         return mask
 
-    # ==========================================
-    # CẢI TIẾN 2: CỬA SỔ TRƯỢT CHỐNG NGÃ TƯ (Thay thế hoàn toàn Raycast)
-    # ==========================================
-    def _find_line_near(self, mask_1d: np.ndarray, expected_x: int, window: int = 80) -> Optional[int]:
-        """Chỉ quét tìm vạch trong một giới hạn (window) quanh vị trí cũ"""
+    # TRẢ VỀ CẢ MÉP TRONG, MÉP NGOÀI VÀ TRUNG ĐIỂM
+    def _get_thick_line_info(self, mask_1d: np.ndarray, expected_x: int, window: int = 80) -> Tuple[Optional[int], Optional[int], Optional[int]]:
         start = max(0, expected_x - window)
         end = min(self.w, expected_x + window)
         
         local_slice = mask_1d[start:end]
         white_indices = np.where(local_slice > 0)[0]
         
-        if len(white_indices) == 0:
-            return None  # Không thấy vạch
+        if len(white_indices) < 3: 
+            return None, None, None
             
-        # TÍNH NĂNG VÀNG: ĐÓNG BĂNG KHI GẶP VẠCH NGANG (NGÃ TƯ)
-        # Nếu vạch trắng lấp đầy > 75% cửa sổ -> Chắc chắn là ngã tư -> Trả về vị trí cũ để đi thẳng
-        if len(white_indices) > (end - start) * 0.75:
-            return expected_x 
+        local_edge_1 = white_indices[0]
+        local_edge_2 = white_indices[-1]
+        line_thickness = local_edge_2 - local_edge_1
+        
+        # Đóng băng ngã tư nếu vạch quá dày
+        if line_thickness > (end - start) * 0.6:
+            return None, None, None 
             
-        # Nếu bình thường, tính tâm của vạch trắng trong cửa sổ
-        local_center = int(np.mean(white_indices))
-        return start + local_center
+        global_e1 = start + local_edge_1
+        global_e2 = start + local_edge_2
+        global_center = start + (local_edge_1 + local_edge_2) // 2
+        return global_e1, global_e2, global_center
 
     def process_frame(self, frame: np.ndarray):
         mask = self._get_clean_mask(frame)
         viz_frame = frame.copy()
         
-        # Hiển thị mask nhỏ ở góc màn hình để dễ debug độ sáng
+        # Mask debug góc màn hình
         mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
         mask_small = cv2.resize(mask_bgr, (160, 120))
         viz_frame[0:120, 0:160] = mask_small
-        cv2.putText(viz_frame, "Binary Mask", (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
 
         car_center_x = self.w // 2
 
-        # Lấy dải ảnh (slice) dày 10 pixel thay vì 1 pixel để chống nhiễu đứt đoạn
-        slice_h = 5
-        bot_slice = mask[max(0, self.y_bottom - slice_h) : min(self.h, self.y_bottom + slice_h), :]
-        top_slice = mask[max(0, self.y_top - slice_h) : min(self.h, self.y_top + slice_h), :]
-        row_bot = np.max(bot_slice, axis=0)
-        row_top = np.max(top_slice, axis=0)
+        # Lấy các điểm neo chuẩn từ ROI ảo để định hướng tìm kiếm
+        vl_bot, vr_bot = int(self.virtual_roi_pts[0][0]), int(self.virtual_roi_pts[1][0])
+        vl_top, vr_top = int(self.virtual_roi_pts[2][0]), int(self.virtual_roi_pts[3][0])
 
-        # Quét tìm vạch bằng Cửa sổ trượt (Sliding Window)
-        l_bot = self._find_line_near(row_bot, self.l_bot_exp, window=100)
-        r_bot = self._find_line_near(row_bot, self.r_bot_exp, window=100)
-        l_top = self._find_line_near(row_top, self.l_top_exp, window=70)
-        r_top = self._find_line_near(row_top, self.r_top_exp, window=70)
-
-        # Logic nội suy độ rộng làn đường
-        valid_widths = []
-        if l_bot is not None and r_bot is not None: valid_widths.append(r_bot - l_bot)
-        if l_top is not None and r_top is not None: valid_widths.append(r_top - l_top)
+        # Tập hợp các điểm trung tâm (Orientation Points) để vẽ đường chạy
+        orientation_points = []
+        is_perfect_frame = True
         
-        if valid_widths:
-            self.lane_width_history.append(np.mean(valid_widths))
-        current_w = int(np.mean(self.lane_width_history)) if self.lane_width_history else self.default_lane_width
+        detected_l_bot, detected_r_bot = None, None
+        detected_l_top, detected_r_top = None, None
 
-        if l_bot is None and r_bot is not None: l_bot = max(0, r_bot - current_w)
-        if r_bot is None and l_bot is not None: r_bot = min(self.w, l_bot + current_w)
-        if l_top is None and r_top is not None: l_top = max(0, r_top - current_w)
-        if r_top is None and l_top is not None: r_top = min(self.w, l_top + current_w)
-
-        steer_final = 0.0
-        bev_vis = np.zeros((self.h, self.w, 3), dtype=np.uint8)
-
-        # ĐIỀU KIỆN CHẶT CHẼ: Hình thang không được phép chéo nhau
-        if (l_bot is not None and r_bot is not None and l_top is not None and r_top is not None 
-            and l_bot < r_bot and l_top < r_top):
+        # Quét nhiều dòng (Tạo ra các bậc thang ngang)
+        y_steps = np.linspace(self.y_bottom, self.y_top, self.num_scans, dtype=int)
+        
+        for i, y in enumerate(y_steps):
+            # Tính tỉ lệ vị trí của dòng hiện tại (0.0 ở bottom, 1.0 ở top)
+            ratio = (self.y_bottom - y) / (self.y_bottom - self.y_top + 1e-5)
             
-            # CẬP NHẬT VỊ TRÍ KỲ VỌNG CHO KHUNG HÌNH SAU (Giúp cửa sổ trượt bám theo cua)
-            self.l_bot_exp = int(0.7 * self.l_bot_exp + 0.3 * l_bot)
-            self.r_bot_exp = int(0.7 * self.r_bot_exp + 0.3 * r_bot)
-            self.l_top_exp = int(0.7 * self.l_top_exp + 0.3 * l_top)
-            self.r_top_exp = int(0.7 * self.r_top_exp + 0.3 * r_top)
-
-            mid_bot_x = int((l_bot + r_bot) / 2)
-            mid_top_x = int((l_top + r_top) / 2)
-            point_of_orientation = (mid_top_x, self.y_top)
-
-            # Cập nhật bộ nhớ dự phòng
-            self.prev_src_pts = np.float32([
-                [l_bot, self.y_bottom], [r_bot, self.y_bottom],
-                [l_top, self.y_top], [r_top, self.y_top]
-            ])
-
-            # Vẽ Hình thang động ôm khít mép trong vạch kẻ
-            trap_pts = np.array([[l_bot, self.y_bottom], [l_top, self.y_top], 
-                                 [r_top, self.y_top], [r_bot, self.y_bottom]], np.int32)
-            cv2.polylines(viz_frame, [trap_pts], True, (0, 165, 255), 3)
+            # Tính nội suy vị trí dự kiến dựa vào ROI ảo trước đó
+            exp_l = int(vl_bot + ratio * (vl_top - vl_bot))
+            exp_r = int(vr_bot + ratio * (vr_top - vr_bot))
             
-            # Vẽ đường Line Center và Point of Orientation
-            cv2.line(viz_frame, (mid_bot_x, self.y_bottom), point_of_orientation, (0, 255, 255), 3)
-            cv2.circle(viz_frame, point_of_orientation, 8, (0, 0, 255), -1)
-            cv2.putText(viz_frame, "Point of Orientation", (mid_top_x + 15, self.y_top), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-
-            # Vẽ các ô tìm kiếm (Sliding Windows) màu xanh dương để debug
-            cv2.rectangle(viz_frame, (self.l_bot_exp - 100, self.y_bottom-10), (self.l_bot_exp + 100, self.y_bottom+10), (255,0,0), 1)
-            cv2.rectangle(viz_frame, (self.r_bot_exp - 100, self.y_bottom-10), (self.r_bot_exp + 100, self.y_bottom+10), (255,0,0), 1)
-            cv2.rectangle(viz_frame, (self.l_top_exp - 70, self.y_top-10), (self.l_top_exp + 70, self.y_top+10), (255,0,0), 1)
-            cv2.rectangle(viz_frame, (self.r_top_exp - 70, self.y_top-10), (self.r_top_exp + 70, self.y_top+10), (255,0,0), 1)
-
-            # PD Controller
-            e_offset = (mid_bot_x - car_center_x) / (self.w / 2.0)
-            e_heading = (mid_top_x - mid_bot_x) / (self.w / 2.0)
-            raw_steer = np.clip((self.Kp * e_offset) + (self.Kd * e_heading), -1.0, 1.0)
-            steer_final = self.steer_ema.update(raw_steer)
-
-            # BEV
-            dst_bev = np.float32([[int(self.w * 0.25), self.h], [int(self.w * 0.75), self.h], 
-                                  [int(self.w * 0.25), 0], [int(self.w * 0.75), 0]])
-            matrix_bev = cv2.getPerspectiveTransform(self.prev_src_pts, dst_bev)
-            bev_vis = cv2.warpPerspective(frame, matrix_bev, (self.w, self.h))
+            row_slice = np.max(mask[max(0, y-2):min(self.h, y+2), :], axis=0)
             
-            mask_bev = cv2.warpPerspective(mask, matrix_bev, (self.w, self.h))
-            mask_bev_bgr = cv2.cvtColor(mask_bev, cv2.COLOR_GRAY2BGR)
-            bev_vis = cv2.addWeighted(bev_vis, 0.7, mask_bev_bgr, 1.0, 0)
+            # Tìm kiếm thông tin vạch
+            le1, le2, l_mid = self._get_thick_line_info(row_slice, exp_l, window=60)
+            re1, re2, r_mid = self._get_thick_line_info(row_slice, exp_r, window=60)
             
-            cv2.line(bev_vis, (self.w//2, self.h), (self.w//2, 0), (0, 255, 0), 1, cv2.LINE_AA)
+            # Nếu mất vạch, dùng luôn điểm ảo của ROI dự phòng (để hình thang luôn kín)
+            if l_mid is None: 
+                l_mid = exp_l; le1 = exp_l - 10; le2 = exp_l + 10; is_perfect_frame = False
+            if r_mid is None: 
+                r_mid = exp_r; re1 = exp_r - 10; re2 = exp_r + 10; is_perfect_frame = False
+
+            # Ghi nhận 4 góc thực tế (Top và Bot) để cập nhật ROI nếu mọi thứ hoàn hảo
+            if i == 0:  # Đang ở Bottom
+                detected_l_bot, detected_r_bot = l_mid, r_mid
+            elif i == self.num_scans - 1:  # Đang ở Top
+                detected_l_top, detected_r_top = l_mid, r_mid
+
+            # ==========================================
+            # VẼ TRỰC QUAN HÓA (VISUALIZATION)
+            # ==========================================
+            # 1. Vẽ 4 cạnh (Mép trong/ngoài) & Độ dày vạch
+            cv2.line(viz_frame, (le1, y), (le2, y), (0, 255, 0), 2)  # Xanh lá: Khoảng cách độ dày
+            cv2.line(viz_frame, (re1, y), (re2, y), (0, 255, 0), 2)
+            cv2.circle(viz_frame, (le1, y), 3, (255, 0, 0), -1)      # Xanh dương: Mép 1
+            cv2.circle(viz_frame, (le2, y), 3, (255, 255, 0), -1)    # Xanh ngọc: Mép 2
+            cv2.circle(viz_frame, (re1, y), 3, (255, 255, 0), -1)
+            cv2.circle(viz_frame, (re2, y), 3, (255, 0, 0), -1)
+
+            # 2. Vẽ Trung điểm của làn xe
+            cv2.circle(viz_frame, (l_mid, y), 4, (0, 255, 255), -1)  # Vàng: Trung điểm trái
+            cv2.circle(viz_frame, (r_mid, y), 4, (0, 255, 255), -1)  # Vàng: Trung điểm phải
+
+            # 3. Vẽ Đường nối ngang 2 bên làn
+            cv2.line(viz_frame, (l_mid, y), (r_mid, y), (200, 100, 200), 1) # Tím mờ: Đường ngang
             
+            # 4. Tính toán và vẽ Điểm định hướng (Point of Orientation)
+            row_center_x = (l_mid + r_mid) // 2
+            orientation_points.append((row_center_x, y))
+            cv2.circle(viz_frame, (row_center_x, y), 5, (0, 0, 255), -1) # Đỏ: Point of Orientation
+
+        # CẬP NHẬT ROI ẢO (Nếu frame hoàn hảo, không bị mất nét nào)
+        if is_perfect_frame and detected_l_bot < detected_r_bot and detected_l_top < detected_r_top:
+            self.virtual_roi_pts[0][0] = (1 - self.roi_alpha) * self.virtual_roi_pts[0][0] + self.roi_alpha * detected_l_bot
+            self.virtual_roi_pts[1][0] = (1 - self.roi_alpha) * self.virtual_roi_pts[1][0] + self.roi_alpha * detected_r_bot
+            self.virtual_roi_pts[2][0] = (1 - self.roi_alpha) * self.virtual_roi_pts[2][0] + self.roi_alpha * detected_l_top
+            self.virtual_roi_pts[3][0] = (1 - self.roi_alpha) * self.virtual_roi_pts[3][0] + self.roi_alpha * detected_r_top
+
+        # ==========================================
+        # VẼ HÌNH THANG ROI & ĐƯỜNG LÁI (STEERING PATH)
+        # ==========================================
+        curr_l_bot = int(self.virtual_roi_pts[0][0])
+        curr_r_bot = int(self.virtual_roi_pts[1][0])
+        curr_l_top = int(self.virtual_roi_pts[2][0])
+        curr_r_top = int(self.virtual_roi_pts[3][0])
+
+        trap_pts = np.array([[curr_l_bot, self.y_bottom], [curr_l_top, self.y_top], 
+                             [curr_r_top, self.y_top], [curr_r_bot, self.y_bottom]], np.int32)
+
+        # Nối các điểm Orientation lại thành Xương sống (Steering path)
+        for i in range(len(orientation_points) - 1):
+            cv2.line(viz_frame, orientation_points[i], orientation_points[i+1], (0, 255, 255), 2)
+        
+        if is_perfect_frame:
+            cv2.polylines(viz_frame, [trap_pts], True, (0, 165, 255), 3)  # Cam: Đang bám tốt
+            status_text = "ROI: LOCKED & TRACKING"
+            color_status = (0, 255, 0)
         else:
-            # FALLBACK: Giữ bộ nhớ cũ khi hình thang chéo nhau hoặc mất vạch!
-            steer_final = self.steer_ema.update(None)
-            cv2.putText(viz_frame, "FALLBACK: KEEPING PREVIOUS SHAPE", (180, 80), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-            
-            # Vẽ lại hình thang cũ mờ hơn (màu đỏ) để báo hiệu
-            trap_pts = np.array([[self.prev_src_pts[0][0], self.prev_src_pts[0][1]], 
-                                 [self.prev_src_pts[2][0], self.prev_src_pts[2][1]], 
-                                 [self.prev_src_pts[3][0], self.prev_src_pts[3][1]], 
-                                 [self.prev_src_pts[1][0], self.prev_src_pts[1][1]]], np.int32)
-            cv2.polylines(viz_frame, [trap_pts], True, (0, 0, 255), 2)
+            cv2.polylines(viz_frame, [trap_pts], True, (0, 0, 255), 3)    # Đỏ: Dùng bộ nhớ ảo
+            status_text = "VIRTUAL ROI: HOLDING SHAPE!"
+            color_status = (0, 0, 255)
 
+        cv2.putText(viz_frame, status_text, (180, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color_status, 2)
+
+        # TÍNH GÓC ĐÁNH LÁI DỰA TRÊN ĐIỂM ORIENTATION TRÊN VÀ DƯỚI CÙNG
+        mid_bot_x = orientation_points[0][0]
+        mid_top_x = orientation_points[-1][0]
+
+        e_offset = (mid_bot_x - car_center_x) / (self.w / 2.0)
+        e_heading = (mid_top_x - mid_bot_x) / (self.w / 2.0)
+        raw_steer = np.clip((self.Kp * e_offset) + (self.Kd * e_heading), -1.0, 1.0)
+        steer_final = self.steer_ema.update(raw_steer)
         cv2.putText(viz_frame, f"STEER: {steer_final:+.3f}", (180, 40), cv2.FONT_HERSHEY_DUPLEX, 1, (255, 255, 255), 2)
+
+        # HIỂN THỊ BEV
+        dst_bev = np.float32([[int(self.w * 0.25), self.h], [int(self.w * 0.75), self.h], 
+                              [int(self.w * 0.25), 0], [int(self.w * 0.75), 0]])
+        matrix_bev = cv2.getPerspectiveTransform(self.virtual_roi_pts, dst_bev)
+        bev_vis = cv2.warpPerspective(frame, matrix_bev, (self.w, self.h))
+        mask_bev = cv2.warpPerspective(mask, matrix_bev, (self.w, self.h))
+        mask_bev_bgr = cv2.cvtColor(mask_bev, cv2.COLOR_GRAY2BGR)
+        bev_vis = cv2.addWeighted(bev_vis, 0.7, mask_bev_bgr, 1.0, 0)
+        cv2.line(bev_vis, (self.w//2, self.h), (self.w//2, 0), (0, 255, 0), 1, cv2.LINE_AA)
+            
         return steer_final, viz_frame, bev_vis
 
 def main():

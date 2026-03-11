@@ -184,18 +184,54 @@ class HardwareDaemon:
         @self.sio.on('auto-navigate')
         async def on_auto_navigate(data):
             path = data.get('path', [])
-            logger.info(f"🚀 Auto-navigate requested: {[p.get('pointId', '?') for p in path]}")
+            order_id = data.get('orderId')
+            is_return = data.get('isReturn', False)
+            initial_heading = data.get('heading')  # [dx, dy] from server
+            logger.info(f"🚀 Auto-navigate requested: {[p.get('pointId', '?') for p in path]} orderId={order_id} isReturn={is_return} heading={initial_heading}")
             if len(path) < 2:
                 logger.warning("Auto-navigate: path too short")
                 return
 
+            # Restore heading from server if daemon has no heading yet
+            if self.navigator.heading is None and initial_heading:
+                self.navigator.set_heading(initial_heading)
+
+            # Prevent concurrent navigations — stop any running one first
+            if self.navigator.navigating:
+                logger.warning("⚠ Navigation already in progress, stopping previous one first")
+                self.navigator.stop_navigation()
+                await asyncio.sleep(0.3)
+
             async def emit_cb(event, payload):
-                """Forward events to backend server."""
-                if self.sio and self.sio.connected:
-                    await self.sio.emit(event, payload)
+                """Forward events to backend server. Safe — never throws."""
+                try:
+                    if self.sio and self.sio.connected:
+                        await self.sio.emit(event, payload)
+                except Exception as e:
+                    logger.warning(f"emit_cb failed ({event}): {e}")
+
+            async def run_and_complete():
+                try:
+                    await self.navigator.navigate_path(path, emit_cb)
+                    # Emit navigation-complete so backend can update order status
+                    heading = list(self.navigator.heading) if self.navigator.heading else None
+                    await emit_cb('navigation-complete', {
+                        'orderId': order_id,
+                        'isReturn': is_return,
+                        'destination': path[-1].get('pointId') if path else None,
+                        'heading': heading,
+                    })
+                    logger.info(f"✅ navigation-complete emitted orderId={order_id} isReturn={is_return} heading={heading}")
+                except Exception as e:
+                    logger.error(f"❌ Navigation failed: {e}")
+                finally:
+                    # ALWAYS stop motor — prevents servo spinning forever
+                    self.motor.stop()
+                    self.navigator.navigating = False
+                    logger.info("🛑 Motor guaranteed stopped after navigation")
 
             # Run navigation in background so we can still receive stop commands
-            asyncio.ensure_future(self.navigator.navigate_path(path, emit_cb))
+            asyncio.ensure_future(run_and_complete())
 
         # ── Stop navigation ──
         @self.sio.on('stop-navigation')
@@ -280,13 +316,13 @@ class HardwareDaemon:
         """
         Move one step forward with CONTINUOUS servo adjustment.
 
-        Instead of: analyse once → steer → drive blind for N seconds → stop,
-        this uses a real-time PID loop:
-          1. Start driving forward
-          2. Every ~80ms: grab frame → BEV → detect → compute steer → adjust motor
-          3. Stop after step_duration
+        Canny's UltimateDynamicTracker already has a built-in PD controller
+        + EMA filter that outputs steer in [-1, +1]. We trust that output
+        directly and only add drift-bias compensation for mechanical offset.
 
-        PID gains tuned for continuous-rotation servo differential drive.
+          1. Start driving forward
+          2. Every ~80ms: grab frame → canny process_frame → get steer → adjust motor
+          3. Stop after step_duration
         """
         import time as _time
         import cv2
@@ -295,23 +331,14 @@ class HardwareDaemon:
         step_duration = data.get('duration', 0.8)
         speed = data.get('speed', 40)
         LOOP_INTERVAL = 0.08          # 80ms → ~12.5 Hz servo update rate
-        KP = 0.70                     # Proportional gain
-        KD = 0.25                     # Derivative gain (dampen oscillation)
-        KI = 0.05                     # Integral gain (correct persistent offset)
-        STEER_EMA_ALPHA = 0.45        # Smooth steer output to avoid servo jitter
         DEAD_ZONE = 0.04              # Ignore tiny corrections
-        MAX_INTEGRAL = 0.3            # Clamp integral windup
-        QUALITY_MIN = 0.15            # Minimum quality to trust canny
 
         try:
-            # Reset PID state for this step
-            self._steer_integral = 0.0
 
             # Start driving
             self.motor.forward(speed)
             start_time = _time.time()
             last_canny_steer = 0.0
-            last_quality = 0.0
             frames_ok = 0
 
             while (_time.time() - start_time) < step_duration:
@@ -319,9 +346,6 @@ class HardwareDaemon:
 
                 # ── Grab frame and detect ──
                 canny_steer = 0.0
-                quality = 0.0
-                centers_count = 0
-                virtual_info_str = ""
 
                 frame_bytes = await self.camera.get_latest_frame()
                 if frame_bytes and CANNY_AVAILABLE and self._lane_tracker:
@@ -329,28 +353,17 @@ class HardwareDaemon:
                         nparr = np.frombuffer(frame_bytes, np.uint8)
                         frame_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
                         if frame_bgr is not None:
+                            frame_bgr = cv2.resize(frame_bgr, (640, 480))
                             steer_val, _, _ = self._lane_tracker.process_frame(frame_bgr)
-                            # steer_val đã qua PD + EMA bên trong tracker
-                            if abs(steer_val) > 0.001 or True:
-                                canny_steer = steer_val
-                                frames_ok += 1
+                            canny_steer = steer_val
+                            frames_ok += 1
                     except Exception as e:
                         logger.debug(f"Step loop detect error: {e}")
 
-                # ── PID controller ──
+                # ── Use canny steer directly ──
+                # Canny's process_frame() already has PD controller + EMA.
+                # We only add minimal drift bias correction here.
                 error = canny_steer
-                derivative = error - self._prev_steer
-
-                # Only accumulate integral when error is meaningful
-                if abs(error) > DEAD_ZONE:
-                    self._steer_integral += error * LOOP_INTERVAL
-                    self._steer_integral = max(-MAX_INTEGRAL,
-                                               min(MAX_INTEGRAL, self._steer_integral))
-                else:
-                    # Decay integral when centered
-                    self._steer_integral *= 0.8
-
-                pid_output = KP * error + KD * derivative + KI * self._steer_integral
 
                 # ── Drift bias (long-term mechanical offset) ──
                 self._drift_ema = self._drift_alpha * error + (1 - self._drift_alpha) * self._drift_ema
@@ -361,11 +374,8 @@ class HardwareDaemon:
                     if drift_std < 0.25 and abs(drift_mean) > 0.04:
                         self._drift_bias = -0.25 * drift_mean
 
-                # ── Final steer with EMA smoothing ──
-                raw_steer = pid_output + self._drift_bias
-                self._servo_steer_ema = (STEER_EMA_ALPHA * raw_steer +
-                                         (1 - STEER_EMA_ALPHA) * self._servo_steer_ema)
-                final_steer = max(-1.0, min(1.0, self._servo_steer_ema))
+                # ── Final steer: canny output + drift bias only ──
+                final_steer = max(-1.0, min(1.0, canny_steer + self._drift_bias))
 
                 # ── Apply to motor ──
                 if abs(final_steer) > DEAD_ZONE:
@@ -378,7 +388,6 @@ class HardwareDaemon:
                 if len(self._drift_history) > 60:
                     self._drift_history = self._drift_history[-40:]
                 last_canny_steer = canny_steer
-                last_quality = quality
 
                 # Sleep remainder of loop interval
                 elapsed = _time.time() - loop_start
@@ -394,7 +403,7 @@ class HardwareDaemon:
             self._map_step_count += 1
 
             logger.info(
-                f"MAP-STEP: final_steer={final_steer:+.3f} quality={last_quality:.0%} "
+                f"MAP-STEP: final_steer={final_steer:+.3f} "
                 f"frames_ok={frames_ok} drift_bias={self._drift_bias:+.3f}"
             )
 
@@ -407,7 +416,6 @@ class HardwareDaemon:
                     'directionName': self._direction_name(),
                     'stepCount': self._map_step_count,
                     'steering': final_steer,
-                    'laneQuality': last_quality,
                     'framesOk': frames_ok,
                     'driftBias': self._drift_bias,
                     'timestamp': _time.time(),
@@ -467,6 +475,7 @@ class HardwareDaemon:
                 return None
 
             h, w = frame.shape[:2]
+            frame = cv2.resize(frame, (640, 480))
             steer, viz_frame, bev_vis = self._lane_tracker.process_frame(frame)
 
             return {
@@ -702,12 +711,12 @@ class HardwareDaemon:
                                 nparr = np.frombuffer(frame_bytes, np.uint8)
                                 frame_bgr = _cv2.imdecode(nparr, _cv2.IMREAD_COLOR)
                                 if frame_bgr is not None:
-                                    h, w = frame_bgr.shape[:2]
+                                    frame_bgr = _cv2.resize(frame_bgr, (640, 480))
                                     steer, vis, bev_vis = self._lane_tracker.process_frame(frame_bgr)
 
                                     # Add position text on viz
                                     pos_text = f"Pos: ({self._map_x},{self._map_y}) Dir: {self._direction_name()}"
-                                    _cv2.putText(vis, pos_text, (15, h - 30), _cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                                    _cv2.putText(vis, pos_text, (15, 480 - 30), _cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
                                     _, jpeg = _cv2.imencode('.jpg', vis, [_cv2.IMWRITE_JPEG_QUALITY, 75])
                                     frame_bytes = jpeg.tobytes()
                             except Exception as e:
@@ -766,6 +775,7 @@ class HardwareDaemon:
                     nparr = np.frombuffer(frame_bytes, np.uint8)
                     frame_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
                     if frame_bgr is not None:
+                        frame_bgr = cv2.resize(frame_bgr, (640, 480))
                         _, vis, _ = self._lane_tracker.process_frame(frame_bgr)
                         _, jpeg = cv2.imencode('.jpg', vis, [cv2.IMWRITE_JPEG_QUALITY, 85])
                         frame_bytes = jpeg.tobytes()
