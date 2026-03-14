@@ -22,6 +22,7 @@ export default function MyOrdersPage() {
     const [loading, setLoading] = useState(true);
     const [confirming, setConfirming] = useState(null);
     const [notifications, setNotifications] = useState([]);
+    const [vehicleReturning, setVehicleReturning] = useState(false);
 
     const addNotification = useCallback((notif) => {
         const id = Date.now() + Math.random();
@@ -78,11 +79,37 @@ export default function MyOrdersPage() {
             loadOrders();
         };
 
+        // Listen for vehicle returning / returned events
+        const handleVehicleReturning = () => {
+            setVehicleReturning(true);
+        };
+        const handleVehicleReturned = () => {
+            setVehicleReturning(false);
+            addNotification({
+                type: 'success',
+                title: 'Xe đã về!',
+                message: 'Xe đã trở về điểm xuất phát.',
+            });
+        };
+
+        // Listen for batch-point-progress (real-time remaining count at a stop)
+        const handleBatchProgress = (data) => {
+            addNotification({
+                type: 'arrived',
+                title: `Còn ${data.remaining} đơn cần xác nhận`,
+                message: data.message,
+            });
+            loadOrders();
+        };
+
         socket.on('delivery-notification', handleDeliveryNotif);
         socket.on('order-arrived', handleOrderArrived);
         socket.on('order-confirmed', loadOrders);
         socket.on('order-delivered', loadOrders);
         socket.on('order-cancelled', loadOrders);
+        socket.on('vehicle-returning', handleVehicleReturning);
+        socket.on('vehicle-returned', handleVehicleReturned);
+        socket.on('batch-point-progress', handleBatchProgress);
 
         // Also listen for new-notification (persistent notifications from DB)
         const handleNewNotification = (notif) => {
@@ -112,6 +139,9 @@ export default function MyOrdersPage() {
             socket.off('order-confirmed');
             socket.off('order-delivered');
             socket.off('order-cancelled');
+            socket.off('vehicle-returning', handleVehicleReturning);
+            socket.off('vehicle-returned', handleVehicleReturned);
+            socket.off('batch-point-progress', handleBatchProgress);
             socket.off('new-notification', handleNewNotification);
         };
     }, [loadOrders, user, addNotification]);
@@ -119,13 +149,37 @@ export default function MyOrdersPage() {
     const handleCustomerConfirm = async (orderId) => {
         setConfirming(orderId);
         try {
-            await customerConfirmOrder(orderId);
-            addNotification({
-                type: 'success',
-                title: 'Đã xác nhận!',
-                message: 'Cảm ơn bạn! Xe sẽ tự động quay về bến.',
-                orderId
-            });
+            const res = await customerConfirmOrder(orderId);
+            const remaining = res.data?.remainingAtPoint || 0;
+            if (remaining > 0) {
+                addNotification({
+                    type: 'arrived',
+                    title: 'Đã xác nhận!',
+                    message: `Còn ${remaining} đơn hàng cần xác nhận tại điểm này. Vui lòng xác nhận hết để xe tiếp tục.`,
+                    orderId
+                });
+            } else {
+                // Check if there are more delivering/confirmed orders in this session
+                const hasMoreOrders = orders.some(o =>
+                    o._id !== orderId && (o.status === 'confirmed' || o.status === 'delivering')
+                );
+                if (hasMoreOrders) {
+                    addNotification({
+                        type: 'success',
+                        title: 'Đã xác nhận!',
+                        message: 'Cảm ơn bạn! Xe sẽ tự động di chuyển đến điểm giao tiếp theo.',
+                        orderId
+                    });
+                } else {
+                    addNotification({
+                        type: 'success',
+                        title: 'Đã xác nhận tất cả!',
+                        message: 'Cảm ơn bạn! Không còn đơn hàng nào. Xe sẽ tự động quay về điểm xuất phát.',
+                        orderId
+                    });
+                    setVehicleReturning(true);
+                }
+            }
             loadOrders();
         } catch (err) {
             addNotification({
@@ -185,13 +239,32 @@ export default function MyOrdersPage() {
 
             <h1 className="text-2xl font-bold text-gray-900 mb-6">Đơn hàng của tôi</h1>
 
+            {/* Vehicle returning banner */}
+            {vehicleReturning && (
+                <div className="mb-6 bg-blue-50 border border-blue-200 rounded-xl p-4 flex items-center gap-3">
+                    <TruckIcon className="w-6 h-6 text-blue-600 animate-bounce flex-shrink-0" />
+                    <div>
+                        <p className="text-sm font-bold text-blue-800">Xe đang trên đường về điểm xuất phát</p>
+                        <p className="text-xs text-blue-600">Tất cả đơn hàng đã được xác nhận. Xe đang tự động quay về.</p>
+                    </div>
+                </div>
+            )}
+
             {/* Arrived orders alert banner */}
-            {orders.some(o => o.status === 'arrived') && (
+            {orders.filter(o => o.status === 'arrived').length > 0 && (
                 <div className="mb-6 bg-green-50 border border-green-200 rounded-xl p-4 flex items-center gap-3">
                     <BellAlertIcon className="w-6 h-6 text-green-600 animate-bounce flex-shrink-0" />
                     <div>
-                        <p className="text-sm font-bold text-green-800">Đơn hàng đã đến!</p>
-                        <p className="text-xs text-green-600">Vui lòng lấy hàng và bấm "Xác nhận đã nhận" để xe quay về.</p>
+                        <p className="text-sm font-bold text-green-800">
+                            {orders.filter(o => o.status === 'arrived').length > 1
+                                ? `${orders.filter(o => o.status === 'arrived').length} đơn hàng đã đến!`
+                                : 'Đơn hàng đã đến!'}
+                        </p>
+                        <p className="text-xs text-green-600">
+                            {orders.filter(o => o.status === 'arrived').length > 1
+                                ? 'Vui lòng xác nhận tất cả đơn hàng để xe tiếp tục hành trình.'
+                                : 'Vui lòng lấy hàng và bấm "Xác nhận đã nhận" để xe quay về.'}
+                        </p>
                     </div>
                 </div>
             )}
@@ -246,7 +319,13 @@ export default function MyOrdersPage() {
                                                 <BellAlertIcon className="w-5 h-5 animate-bounce" />
                                                 <div>
                                                     <p className="text-sm font-bold">Xe đã đến điểm giao hàng!</p>
-                                                    <p className="text-xs text-green-600">Vui lòng lấy hàng và bấm xác nhận bên dưới.</p>
+                                                    {orders.filter(o => o.status === 'arrived' && o.destinationPoint === order.destinationPoint).length > 1 ? (
+                                                        <p className="text-xs text-green-600">
+                                                            Có {orders.filter(o => o.status === 'arrived' && o.destinationPoint === order.destinationPoint).length} đơn tại điểm {order.destinationPoint}. Xác nhận hết để xe tiếp tục.
+                                                        </p>
+                                                    ) : (
+                                                        <p className="text-xs text-green-600">Vui lòng lấy hàng và bấm xác nhận bên dưới.</p>
+                                                    )}
                                                 </div>
                                             </div>
                                         </div>

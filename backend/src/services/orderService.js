@@ -116,6 +116,32 @@ class OrderService {
         }).sort({ batchOrder: 1 });
     }
 
+    // Get all batch orders at a specific destination that are still in transit
+    async getBatchOrdersAtDestination(batchId, destinationPoint) {
+        return await Order.find({
+            batchId,
+            destinationPoint,
+            status: { $in: ['confirmed', 'delivering'] }
+        });
+    }
+
+    // Get remaining arrived (not yet customer-confirmed) orders at a destination
+    async getArrivedOrdersAtDestination(batchId, destinationPoint) {
+        return await Order.find({
+            batchId,
+            destinationPoint,
+            status: 'arrived'
+        });
+    }
+
+    // Get next undelivered batch order (any destination)
+    async getNextUndeliveredBatchOrder(batchId) {
+        return await Order.findOne({
+            batchId,
+            status: { $in: ['confirmed', 'delivering'] }
+        }).sort({ batchOrder: 1 });
+    }
+
     async cancelOrder(id) {
         const order = await Order.findByIdAndUpdate(
             id,

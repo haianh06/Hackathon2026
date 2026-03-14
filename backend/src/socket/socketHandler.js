@@ -56,6 +56,18 @@ function setupSocket(io) {
                 }
             }
 
+            // ── Return trip completed — reset vehicle to start ──
+            if (data.isReturn) {
+                try {
+                    await vehicleService.returnToWarehouse();
+                    io.emit('vehicle-returned', { message: 'Xe đã về điểm xuất phát' });
+                    console.log('Vehicle returned to start');
+                } catch (err) {
+                    console.error('Error resetting vehicle after return:', err);
+                }
+                return;
+            }
+
             // Check if this is a delivery completion (not a return trip)
             if (data.orderId && !data.isReturn) {
                 try {
@@ -64,36 +76,50 @@ function setupSocket(io) {
                         // Mark order as arrived
                         const updatedOrder = await orderService.markArrived(data.orderId);
 
-                        // Notify everyone about arrival
-                        io.emit('order-arrived', {
-                            order: updatedOrder,
-                            message: `Đơn hàng #${updatedOrder._id.toString().slice(-6).toUpperCase()} đã được giao tới ${updatedOrder.destinationPoint}. Vui lòng lấy hàng và xác nhận!`
-                        });
-
-                        // Targeted notification to the customer
-                        if (order.customer) {
-                            const customerId = order.customer._id || order.customer;
-
-                            // Save notification to DB
-                            try {
-                                await notificationService.createAndEmit(io, {
-                                    user: customerId,
-                                    order: updatedOrder._id,
-                                    type: 'order_arrived',
-                                    title: 'Đơn hàng đã đến!',
-                                    message: `Đơn hàng #${updatedOrder._id.toString().slice(-6).toUpperCase()} đã được giao tới điểm ${updatedOrder.destinationPoint}. Vui lòng lấy hàng và xác nhận đơn hàng.`
-                                });
-                            } catch (notifErr) {
-                                console.error('Error creating notification:', notifErr);
-                            }
-
-                            io.to(`customer-${customerId}`).emit('delivery-notification', {
-                                orderId: updatedOrder._id,
-                                type: 'arrived',
-                                title: 'Đơn hàng đã đến!',
-                                message: `Đơn hàng #${updatedOrder._id.toString().slice(-6).toUpperCase()} đã được giao tới điểm ${updatedOrder.destinationPoint}. Vui lòng lấy hàng và xác nhận đơn hàng.`,
-                                destinationPoint: updatedOrder.destinationPoint
+                        // Helper to notify a customer about order arrival
+                        const notifyArrival = async (arrivedOrder, custId) => {
+                            io.emit('order-arrived', {
+                                order: arrivedOrder,
+                                message: `Đơn hàng #${arrivedOrder._id.toString().slice(-6).toUpperCase()} đã được giao tới ${arrivedOrder.destinationPoint}. Vui lòng lấy hàng và xác nhận!`
                             });
+                            if (custId) {
+                                try {
+                                    await notificationService.createAndEmit(io, {
+                                        user: custId,
+                                        order: arrivedOrder._id,
+                                        type: 'order_arrived',
+                                        title: 'Đơn hàng đã đến!',
+                                        message: `Đơn hàng #${arrivedOrder._id.toString().slice(-6).toUpperCase()} đã được giao tới điểm ${arrivedOrder.destinationPoint}. Vui lòng lấy hàng và xác nhận đơn hàng.`
+                                    });
+                                } catch (notifErr) {
+                                    console.error('Error creating notification:', notifErr);
+                                }
+                                io.to(`customer-${custId}`).emit('delivery-notification', {
+                                    orderId: arrivedOrder._id,
+                                    type: 'arrived',
+                                    title: 'Đơn hàng đã đến!',
+                                    message: `Đơn hàng #${arrivedOrder._id.toString().slice(-6).toUpperCase()} đã được giao tới điểm ${arrivedOrder.destinationPoint}. Vui lòng lấy hàng và xác nhận đơn hàng.`,
+                                    destinationPoint: arrivedOrder.destinationPoint
+                                });
+                            }
+                        };
+
+                        // Notify for the primary order
+                        const primaryCustomerId = order.customer ? (order.customer._id || order.customer) : null;
+                        await notifyArrival(updatedOrder, primaryCustomerId);
+
+                        // If batch order, also mark all sibling orders at the same destination as arrived
+                        if (order.batchId) {
+                            const siblings = await orderService.getBatchOrdersAtDestination(
+                                order.batchId, order.destinationPoint
+                            );
+                            for (const sibling of siblings) {
+                                if (sibling._id.toString() === data.orderId) continue;
+                                await orderService.startDelivery(sibling._id);
+                                const arrivedSibling = await orderService.markArrived(sibling._id);
+                                const sibCustId = sibling.customer ? (sibling.customer._id || sibling.customer) : null;
+                                await notifyArrival(arrivedSibling, sibCustId);
+                            }
                         }
                     }
                 } catch (err) {
@@ -178,6 +204,32 @@ function setupSocket(io) {
         // Hardware → Frontend: RFID scan status (scanning/stopped)
         socket.on('rfid-scan-status', (data) => {
             io.to('admin').emit('rfid-scan-status', data);
+        });
+
+        // ====== Motor Calibration Events ======
+        // Frontend → Hardware: send raw PWM pulse to a specific motor
+        socket.on('motor-calibrate-set', (data) => {
+            io.to('hardware').emit('motor-calibrate-set', data);
+        });
+
+        // Frontend → Hardware: run a sweep test (ramp PWM up/down)
+        socket.on('motor-calibrate-sweep', (data) => {
+            io.to('hardware').emit('motor-calibrate-sweep', data);
+        });
+
+        // Frontend → Hardware: run a step response test
+        socket.on('motor-calibrate-step', (data) => {
+            io.to('hardware').emit('motor-calibrate-step', data);
+        });
+
+        // Frontend → Hardware: stop calibration test
+        socket.on('motor-calibrate-stop', () => {
+            io.to('hardware').emit('motor-calibrate-stop');
+        });
+
+        // Hardware → Frontend: calibration data point (real-time)
+        socket.on('motor-calibrate-data', (data) => {
+            io.to('admin').emit('motor-calibrate-data', data);
         });
 
         socket.on('disconnect', () => {

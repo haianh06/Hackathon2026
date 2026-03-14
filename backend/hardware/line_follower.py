@@ -197,7 +197,7 @@ class LineFollower:
         self._init_canny_detector()
 
     def _init_canny_detector(self):
-        """Lazily initialise the canny edge detector (UltimateDynamicTracker).
+        """Lazily initialise the canny edge detector (AdaptiveTrackerV2).
 
         Canny is the PRIMARY steering source — it computes the Point of
         Orientation from edge detection and drives a PD controller.
@@ -209,10 +209,10 @@ class LineFollower:
                                       '..', 'canny-edge-detection-main')
             if canny_path not in sys.path:
                 sys.path.insert(0, canny_path)
-            from test_1_improved import UltimateDynamicTracker
-            self._canny_detector = UltimateDynamicTracker(width=640, height=480)
+            from test_1_improved import AdaptiveTrackerV2
+            self._canny_detector = AdaptiveTrackerV2(width=640, height=480)
             self._canny_available = True
-            logger.info("✅ Canny UltimateDynamicTracker loaded for PRIMARY lane steering")
+            logger.info("✅ Canny AdaptiveTrackerV2 loaded for PRIMARY lane steering")
         except Exception as e:
             self._canny_available = False
             logger.debug(f"Canny detector not available: {e}")
@@ -246,7 +246,7 @@ class LineFollower:
         Analyse a JPEG frame and return EMA-smoothed steering correction [-1 … +1].
 
         Decision hierarchy:
-          1. CANNY (primary) — UltimateDynamicTracker computes the Point of
+          1. CANNY (primary) — AdaptiveTrackerV2 computes the Point of
              Orientation from sliding-window edge detection + PD controller.
              The vehicle steers toward this point.
           2. UNET (secondary) — only used as a safety check: if the UNet
@@ -270,7 +270,7 @@ class LineFollower:
             if self._canny_available and self._canny_detector is not None:
                 try:
                     frame_resized = self._cv2.resize(frame, (640, 480))
-                    steer_val, _, _ = self._canny_detector.process_frame(frame_resized)
+                    steer_val, _ = self._canny_detector.process_frame(frame_resized)
                     canny_steer = float(steer_val)
                 except Exception as e:
                     logger.debug(f"Canny detection error: {e}")

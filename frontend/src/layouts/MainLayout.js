@@ -14,6 +14,7 @@ import {
     XMarkIcon,
     UserCircleIcon,
     SignalIcon,
+    WrenchScrewdriverIcon,
 } from '@heroicons/react/24/outline';
 import { TruckIcon as TruckSolid } from '@heroicons/react/24/solid';
 
@@ -31,6 +32,7 @@ const navConfig = {
         { to: '/admin/logs', icon: ClipboardDocumentListIcon, label: 'Delivery Logs' },
         { to: '/admin/map-builder', icon: MapIcon, label: 'Map Builder' },
         { to: '/admin/rfid', icon: SignalIcon, label: 'Quản lý RFID' },
+        { to: '/admin/motor-calibration', icon: WrenchScrewdriverIcon, label: 'Đo động cơ' },
         { to: '/map', icon: TruckIcon, label: 'Bản đồ & Xe' },
     ],
 };

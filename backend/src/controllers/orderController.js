@@ -181,43 +181,78 @@ class OrderController {
                     }
                 }
 
-                // Check if there are more orders in this batch
-                const nextOrder = order.batchId
-                    ? await orderService.getNextBatchOrder(order.batchId, order.batchOrder)
-                    : null;
+                if (order.batchId) {
+                    // ── Batch order: check if there are remaining arrived orders at this point ──
+                    const remainingAtPoint = await orderService.getArrivedOrdersAtDestination(
+                        order.batchId, order.destinationPoint
+                    );
 
-                if (nextOrder) {
-                    // Navigate to the next order's destination
-                    await orderService.startDelivery(nextOrder._id);
-                    const nextPath = await mapService.findPath(order.destinationPoint, nextOrder.destinationPoint);
-                    if (nextPath && nextPath.length >= 2) {
-                        const pathData = nextPath.map(p => ({ pointId: p.pointId, x: p.x, y: p.y }));
-                        const vehicle = await vehicleService.getVehicle();
-                        io.to('hardware').emit('auto-navigate', {
-                            path: pathData,
-                            returnPath: [],
-                            orderId: nextOrder._id.toString(),
+                    if (remainingAtPoint.length > 0) {
+                        // Still have orders at this point waiting for customer confirmation
+                        io.emit('batch-point-progress', {
                             batchId: order.batchId,
-                            heading: vehicle.heading || null
+                            destinationPoint: order.destinationPoint,
+                            remaining: remainingAtPoint.length,
+                            message: `Còn ${remainingAtPoint.length} đơn hàng cần xác nhận tại ${order.destinationPoint}`
                         });
-                        io.emit('vehicle-dispatch', { path: nextPath, orderId: nextOrder._id.toString() });
+                        return res.json({
+                            success: true,
+                            data: updatedOrder,
+                            remainingAtPoint: remainingAtPoint.length
+                        });
                     }
 
-                    // Notify customer of next order
-                    if (nextOrder.customer) {
-                        try {
-                            const nextCustomerId = nextOrder.customer._id || nextOrder.customer;
-                            await notificationService.createAndEmit(io, {
-                                user: nextCustomerId,
-                                order: nextOrder._id,
-                                type: 'order_delivering',
-                                title: 'Xe đang trên đường giao!',
-                                message: `Đơn hàng #${nextOrder._id.toString().slice(-6).toUpperCase()} đang được giao đến điểm ${nextOrder.destinationPoint}.`
+                    // All orders at this point confirmed — check for next destination
+                    const nextOrder = await orderService.getNextUndeliveredBatchOrder(order.batchId);
+
+                    if (nextOrder) {
+                        // Navigate to the next order's destination
+                        await orderService.startDelivery(nextOrder._id);
+                        const nextPath = await mapService.findPath(order.destinationPoint, nextOrder.destinationPoint);
+                        if (nextPath && nextPath.length >= 2) {
+                            const pathData = nextPath.map(p => ({ pointId: p.pointId, x: p.x, y: p.y }));
+                            const vehicle = await vehicleService.getVehicle();
+                            io.to('hardware').emit('auto-navigate', {
+                                path: pathData,
+                                returnPath: [],
+                                orderId: nextOrder._id.toString(),
+                                batchId: order.batchId,
+                                heading: vehicle.heading || null
                             });
-                        } catch (e) { console.error(e); }
+                            io.emit('vehicle-dispatch', { path: nextPath, orderId: nextOrder._id.toString() });
+                        }
+
+                        // Notify customer of next order
+                        if (nextOrder.customer) {
+                            try {
+                                const nextCustomerId = nextOrder.customer._id || nextOrder.customer;
+                                await notificationService.createAndEmit(io, {
+                                    user: nextCustomerId,
+                                    order: nextOrder._id,
+                                    type: 'order_delivering',
+                                    title: 'Xe đang trên đường giao!',
+                                    message: `Đơn hàng #${nextOrder._id.toString().slice(-6).toUpperCase()} đang được giao đến điểm ${nextOrder.destinationPoint}.`
+                                });
+                            } catch (e) { console.error(e); }
+                        }
+                    } else {
+                        // No more orders in batch — return the vehicle to start
+                        const returnPath = await mapService.findPath(order.destinationPoint, 'S');
+                        if (returnPath && returnPath.length >= 2) {
+                            const returnData = returnPath.map(p => ({ pointId: p.pointId, x: p.x, y: p.y }));
+                            const vehicle = await vehicleService.getVehicle();
+                            io.to('hardware').emit('auto-navigate', {
+                                path: returnData,
+                                returnPath: [],
+                                orderId: order._id.toString(),
+                                isReturn: true,
+                                heading: vehicle.heading || null
+                            });
+                            io.emit('vehicle-returning', { orderId: order._id.toString(), path: returnPath });
+                        }
                     }
                 } else {
-                    // No more orders — return the vehicle to start
+                    // ── Non-batch single order — return the vehicle to start ──
                     const returnPath = await mapService.findPath(order.destinationPoint, 'S');
                     if (returnPath && returnPath.length >= 2) {
                         const returnData = returnPath.map(p => ({ pointId: p.pointId, x: p.x, y: p.y }));

@@ -46,12 +46,12 @@ except ImportError as e:
 # Import canny edge detection
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'canny-edge-detection-main'))
 try:
-    from test_1_improved import UltimateDynamicTracker
+    from test_1_improved import AdaptiveTrackerV2
     CANNY_AVAILABLE = True
-    logger.info("UltimateDynamicTracker loaded successfully")
+    logger.info("AdaptiveTrackerV2 loaded successfully")
 except ImportError as e:
     CANNY_AVAILABLE = False
-    logger.warning(f"UltimateDynamicTracker not available: {e}")
+    logger.warning(f"AdaptiveTrackerV2 not available: {e}")
 
 # Socket.IO client
 try:
@@ -95,7 +95,7 @@ class HardwareDaemon:
         self._map_y = 0  # grid coordinate y
         self._map_direction = 0  # 0=up(+y), 1=right(+x), 2=down(-y), 3=left(-x)
         self._map_step_count = 0
-        self._lane_tracker = UltimateDynamicTracker(width=640, height=480) if CANNY_AVAILABLE else None
+        self._lane_tracker = AdaptiveTrackerV2(width=640, height=480) if CANNY_AVAILABLE else None
 
         # ── RFID scanner state ──
         self._rfid_scanning = False
@@ -123,6 +123,23 @@ class HardwareDaemon:
         self._servo_steer_ema = 0.0    # smoothed steer for servo
         self._prev_steer = 0.0         # previous steer for derivative
         self._steer_integral = 0.0     # integral term for PID
+
+        # ── Motor calibration state ──
+        self._calibrate_running = False
+
+    def _calibrate_pwm(self, pin_name, pulse_us):
+        """Apply PWM for calibration, inverting left motor around 1500µs.
+        Left servo is mirror-mounted, so its direction is inverted:
+        left_actual = 3000 - pulse_us (e.g. 1800→1200, 1300→1700)
+        This makes both motors respond in the same physical direction
+        for the same commanded pulse value."""
+        if pin_name == 'left':
+            actual = 3000 - pulse_us
+        else:
+            actual = pulse_us
+        target_pin = self.motor.left_pin if pin_name == 'left' else self.motor.right_pin
+        if hasattr(self.motor, '_set_pwm'):
+            self.motor._set_pwm(target_pin, actual)
 
     async def connect_to_server(self):
         """Connect to Node.js backend via Socket.IO"""
@@ -284,6 +301,44 @@ class HardwareDaemon:
             """Analyse current frame with canny and return results."""
             asyncio.ensure_future(self._map_build_analyse())
 
+        # ====== Motor Calibration Commands ======
+        @self.sio.on('motor-calibrate-set')
+        async def on_motor_calibrate_set(data):
+            """Set PWM pulse width on a specific motor pin (auto-inverts left)."""
+            pin = data.get('pin', 'left')  # 'left' or 'right'
+            pulse_us = int(data.get('pulse_us', 1500))
+            logger.info(f"🔧 Calibrate: set {pin} to {pulse_us}µs")
+            self._calibrate_pwm(pin, pulse_us)
+            # Report back
+            if self.sio and self.sio.connected:
+                await self.sio.emit('motor-calibrate-data', {
+                    'type': 'set',
+                    'pin': pin,
+                    'pulse_us': pulse_us,
+                    'timestamp': asyncio.get_event_loop().time()
+                })
+
+        @self.sio.on('motor-calibrate-sweep')
+        async def on_motor_calibrate_sweep(data):
+            """Run a sweep test: ramp PWM from start to end and back."""
+            logger.info(f"🔧 Calibrate: sweep test requested")
+            self._calibrate_running = True
+            asyncio.ensure_future(self._run_sweep_test(data))
+
+        @self.sio.on('motor-calibrate-step')
+        async def on_motor_calibrate_step(data):
+            """Run a step response test: jump to target PWM and hold."""
+            logger.info(f"🔧 Calibrate: step test requested")
+            self._calibrate_running = True
+            asyncio.ensure_future(self._run_step_test(data))
+
+        @self.sio.on('motor-calibrate-stop')
+        async def on_motor_calibrate_stop(data=None):
+            """Stop any running calibration test."""
+            logger.info("🔧 Calibrate: stop")
+            self._calibrate_running = False
+            self.motor.stop()
+
         try:
             await self.sio.connect(self.server_url)
         except Exception as e:
@@ -316,9 +371,9 @@ class HardwareDaemon:
         """
         Move one step forward with CONTINUOUS servo adjustment.
 
-        Canny's UltimateDynamicTracker already has a built-in PD controller
-        + EMA filter that outputs steer in [-1, +1]. We trust that output
-        directly and only add drift-bias compensation for mechanical offset.
+        AdaptiveTrackerV2 has a built-in PD controller + EMA filter
+        that outputs steer in [-1, +1]. We trust that output directly
+        and only add drift-bias compensation for mechanical offset.
 
           1. Start driving forward
           2. Every ~80ms: grab frame → canny process_frame → get steer → adjust motor
@@ -354,7 +409,7 @@ class HardwareDaemon:
                         frame_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
                         if frame_bgr is not None:
                             frame_bgr = cv2.resize(frame_bgr, (640, 480))
-                            steer_val, _, _ = self._lane_tracker.process_frame(frame_bgr)
+                            steer_val, _ = self._lane_tracker.process_frame(frame_bgr)
                             canny_steer = steer_val
                             frames_ok += 1
                     except Exception as e:
@@ -459,7 +514,7 @@ class HardwareDaemon:
             self.motor.stop()
 
     async def _do_canny_analysis(self):
-        """Run UltimateDynamicTracker on current frame."""
+        """Run AdaptiveTrackerV2 on current frame."""
         if not CANNY_AVAILABLE or self._lane_tracker is None:
             return None
 
@@ -476,7 +531,7 @@ class HardwareDaemon:
 
             h, w = frame.shape[:2]
             frame = cv2.resize(frame, (640, 480))
-            steer, viz_frame, bev_vis = self._lane_tracker.process_frame(frame)
+            steer, viz_frame = self._lane_tracker.process_frame(frame)
 
             return {
                 'steering': float(steer),
@@ -507,6 +562,117 @@ class HardwareDaemon:
         except Exception as e:
             logger.debug(f"UNet correction error: {e}")
             return 0.0
+
+    # ====== Motor Calibration Methods ======
+    async def _run_sweep_test(self, data):
+        """Ramp PWM from start_us to end_us, then back, reporting data points."""
+        pin = data.get('pin', 'both')  # 'left', 'right', or 'both'
+        start_us = int(data.get('start_us', 1500))
+        end_us = int(data.get('end_us', 1800))
+        step_us = int(data.get('step_us', 10))
+        hold_ms = int(data.get('hold_ms', 200))
+
+        pin_names = []
+        if pin in ('left', 'both'):
+            pin_names.append('left')
+        if pin in ('right', 'both'):
+            pin_names.append('right')
+
+        direction = 1 if end_us > start_us else -1
+        current = start_us
+        t0 = asyncio.get_event_loop().time()
+
+        # Sweep forward
+        while self._calibrate_running:
+            for pname in pin_names:
+                self._calibrate_pwm(pname, current)
+            elapsed = asyncio.get_event_loop().time() - t0
+            if self.sio and self.sio.connected:
+                await self.sio.emit('motor-calibrate-data', {
+                    'type': 'sweep', 'pin': pin,
+                    'pulse_us': current, 'time': round(elapsed, 3),
+                    'phase': 'forward'
+                })
+            await asyncio.sleep(hold_ms / 1000.0)
+            current += step_us * direction
+            if (direction > 0 and current > end_us) or (direction < 0 and current < end_us):
+                break
+
+        # Sweep back
+        current = end_us
+        while self._calibrate_running:
+            for pname in pin_names:
+                self._calibrate_pwm(pname, current)
+            elapsed = asyncio.get_event_loop().time() - t0
+            if self.sio and self.sio.connected:
+                await self.sio.emit('motor-calibrate-data', {
+                    'type': 'sweep', 'pin': pin,
+                    'pulse_us': current, 'time': round(elapsed, 3),
+                    'phase': 'reverse'
+                })
+            await asyncio.sleep(hold_ms / 1000.0)
+            current -= step_us * direction
+            if (direction > 0 and current < start_us) or (direction < 0 and current > start_us):
+                break
+
+        # Done - stop motors
+        self.motor.stop()
+        self._calibrate_running = False
+        if self.sio and self.sio.connected:
+            await self.sio.emit('motor-calibrate-data', {
+                'type': 'sweep_done', 'pin': pin
+            })
+
+    async def _run_step_test(self, data):
+        """Jump to target PWM and hold, reporting data over time."""
+        pin = data.get('pin', 'both')
+        target_us = int(data.get('target_us', 1800))
+        duration_s = float(data.get('duration_s', 3.0))
+        sample_ms = int(data.get('sample_ms', 50))
+
+        pin_names = []
+        if pin in ('left', 'both'):
+            pin_names.append('left')
+        if pin in ('right', 'both'):
+            pin_names.append('right')
+
+        t0 = asyncio.get_event_loop().time()
+
+        # Initial neutral reading
+        for pname in pin_names:
+            self._calibrate_pwm(pname, 1500)
+        if self.sio and self.sio.connected:
+            await self.sio.emit('motor-calibrate-data', {
+                'type': 'step', 'pin': pin,
+                'pulse_us': 1500, 'time': 0.0, 'phase': 'idle'
+            })
+        await asyncio.sleep(0.5)
+
+        # Step to target
+        for pname in pin_names:
+            self._calibrate_pwm(pname, target_us)
+
+        elapsed = 0
+        while self._calibrate_running and elapsed < duration_s:
+            elapsed = asyncio.get_event_loop().time() - t0
+            if self.sio and self.sio.connected:
+                await self.sio.emit('motor-calibrate-data', {
+                    'type': 'step', 'pin': pin,
+                    'pulse_us': target_us, 'time': round(elapsed, 3),
+                    'phase': 'active'
+                })
+            await asyncio.sleep(sample_ms / 1000.0)
+
+        # Return to neutral
+        self.motor.stop()
+        elapsed = asyncio.get_event_loop().time() - t0
+        if self.sio and self.sio.connected:
+            await self.sio.emit('motor-calibrate-data', {
+                'type': 'step', 'pin': pin,
+                'pulse_us': 0, 'time': round(elapsed, 3),
+                'phase': 'done'
+            })
+        self._calibrate_running = False
 
     # ====== RFID Methods ======
     async def _rfid_scan_loop(self):
@@ -712,7 +878,7 @@ class HardwareDaemon:
                                 frame_bgr = _cv2.imdecode(nparr, _cv2.IMREAD_COLOR)
                                 if frame_bgr is not None:
                                     frame_bgr = _cv2.resize(frame_bgr, (640, 480))
-                                    steer, vis, bev_vis = self._lane_tracker.process_frame(frame_bgr)
+                                    steer, vis = self._lane_tracker.process_frame(frame_bgr)
 
                                     # Add position text on viz
                                     pos_text = f"Pos: ({self._map_x},{self._map_y}) Dir: {self._direction_name()}"
@@ -776,7 +942,7 @@ class HardwareDaemon:
                     frame_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
                     if frame_bgr is not None:
                         frame_bgr = cv2.resize(frame_bgr, (640, 480))
-                        _, vis, _ = self._lane_tracker.process_frame(frame_bgr)
+                        _, vis = self._lane_tracker.process_frame(frame_bgr)
                         _, jpeg = cv2.imencode('.jpg', vis, [cv2.IMWRITE_JPEG_QUALITY, 85])
                         frame_bytes = jpeg.tobytes()
                 except Exception as e:

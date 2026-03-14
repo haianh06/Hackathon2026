@@ -64,12 +64,20 @@ export default function StaffOrdersPage() {
 
         socket.on('navigation-log', handleNavLog);
         socket.on('vehicle-position', handleVehiclePos);
-        socket.on('vehicle-returned', () => { setLivePos(null); setVehiclePosition('S'); });
+        socket.on('vehicle-returned', () => {
+            setLivePos(null);
+            setVehiclePosition('S');
+            setNotification({ message: 'Xe đã về điểm xuất phát!', type: 'success' });
+        });
+        socket.on('vehicle-returning', () => {
+            setNotification({ message: 'Xe đang tự động quay về điểm xuất phát...', type: 'info' });
+        });
 
         return () => {
             socket.off('navigation-log', handleNavLog);
             socket.off('vehicle-position', handleVehiclePos);
             socket.off('vehicle-returned');
+            socket.off('vehicle-returning');
         };
     }, []);
 
