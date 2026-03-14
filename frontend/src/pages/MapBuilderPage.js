@@ -5,11 +5,9 @@ import {
     StopIcon, MapPinIcon, CheckCircleIcon, XCircleIcon,
     TrashIcon, ArrowDownTrayIcon
 } from '@heroicons/react/24/outline';
-import { VideoCameraIcon, CameraIcon } from '@heroicons/react/24/outline';
+import { VideoCameraIcon, CameraIcon, EyeIcon } from '@heroicons/react/24/outline';
 
-const STREAM_URL = '/camera/stream';
-const LANE_STREAM_URL = '/camera/canny/stream';
-const UNET_STREAM_URL = '/camera/lane/stream';
+const PROCESSED_URL = '/camera/processed/stream';
 const SNAPSHOT_URL = '/camera/snapshot';
 const DEBUG_URL = '/camera/lane/debug';
 
@@ -28,7 +26,7 @@ export default function MapBuilderPage() {
 
     // Camera
     const [cameraOn, setCameraOn] = useState(false);
-    const [cameraMode, setCameraMode] = useState('raw'); // 'raw' | 'canny' | 'unet'
+    const [cameraMode, setCameraMode] = useState('raw'); // 'raw' | 'canny' | 'unet' | 'sign' | 'all'
     const cameraImgRef = useRef(null);
 
     // Screenshot
@@ -50,6 +48,18 @@ export default function MapBuilderPage() {
 
     // Point label input
     const [labelInput, setLabelInput] = useState('');
+
+    // Road sign detection
+    const [signDetecting, setSignDetecting] = useState(false);
+    const [signDetections, setSignDetections] = useState([]);
+
+    const addLog = useCallback((msg) => {
+        const ts = new Date().toLocaleTimeString('vi-VN');
+        setLogs(prev => {
+            const next = [...prev, `[${ts}] ${msg}`];
+            return next.length > 300 ? next.slice(-200) : next;
+        });
+    }, []);
 
     useEffect(() => {
         socket.emit('join-room', 'admin');
@@ -123,20 +133,45 @@ export default function MapBuilderPage() {
             socket.off('map-build-position', handlePosition);
             socket.off('map-build-analysis', handleAnalysis);
         };
-    }, []);
+    }, [addLog]);
+
+    // Road sign detection events
+    useEffect(() => {
+        const onStatus = (data) => {
+            setSignDetecting(data.detecting);
+            if (!data.detecting) setSignDetections([]);
+        };
+        const onDetected = (data) => {
+            setSignDetections(data.detections || []);
+            if (data.detections && data.detections.length > 0) {
+                const names = data.detections.map(d => `${d.class} (${(d.confidence * 100).toFixed(0)}%)`);
+                addLog(`🚦 Biển báo: ${names.join(', ')}`);
+            }
+        };
+        const onResult = (data) => {
+            setSignDetections(data.detections || []);
+            if (data.detections && data.detections.length > 0) {
+                const names = data.detections.map(d => `${d.class} (${(d.confidence * 100).toFixed(0)}%)`);
+                addLog(`🚦 Phát hiện: ${names.join(', ')}`);
+            } else {
+                addLog('🚦 Không phát hiện biển báo');
+            }
+        };
+
+        socket.on('sign-detect-status', onStatus);
+        socket.on('sign-detected', onDetected);
+        socket.on('sign-detect-result', onResult);
+        return () => {
+            socket.off('sign-detect-status', onStatus);
+            socket.off('sign-detected', onDetected);
+            socket.off('sign-detect-result', onResult);
+        };
+    }, [addLog]);
 
     // Auto-scroll logs
     useEffect(() => {
         if (logEndRef.current) logEndRef.current.scrollIntoView({ behavior: 'smooth' });
     }, [logs]);
-
-    const addLog = useCallback((msg) => {
-        const ts = new Date().toLocaleTimeString('vi-VN');
-        setLogs(prev => {
-            const next = [...prev, `[${ts}] ${msg}`];
-            return next.length > 300 ? next.slice(-200) : next;
-        });
-    }, []);
 
     // Move one step forward
     const handleStep = useCallback(() => {
@@ -165,6 +200,26 @@ export default function MapBuilderPage() {
     const handleAnalyse = useCallback(() => {
         socket.emit('map-build-analyse');
         addLog('🔍 Đang phân tích canny + UNet...');
+    }, [addLog]);
+
+    // Toggle sign detection
+    const toggleSignDetection = useCallback(() => {
+        if (signDetecting) {
+            socket.emit('sign-detect-stop');
+            setSignDetecting(false);
+            setSignDetections([]);
+            addLog('🚦 Tắt nhận diện biển báo');
+        } else {
+            socket.emit('sign-detect-start');
+            setSignDetecting(true);
+            addLog('🚦 Bật nhận diện biển báo');
+        }
+    }, [signDetecting, addLog]);
+
+    // Single-frame sign detect
+    const handleSignDetectOnce = useCallback(() => {
+        socket.emit('sign-detect-once');
+        addLog('🚦 Đang phát hiện biển báo (1 frame)...');
     }, [addLog]);
 
     // Approve pending point
@@ -310,8 +365,7 @@ export default function MapBuilderPage() {
     const gridH = maxY - minY + 1;
     const cellSize = Math.min(28, Math.max(16, Math.floor(400 / Math.max(gridW, gridH))));
 
-    const streamUrls = { raw: STREAM_URL, canny: LANE_STREAM_URL, unet: UNET_STREAM_URL };
-    const currentStreamUrl = streamUrls[cameraMode] || STREAM_URL;
+    const currentStreamUrl = `${PROCESSED_URL}?mode=${cameraMode}`;
 
     return (
         <div className="max-w-7xl mx-auto">
@@ -339,10 +393,13 @@ export default function MapBuilderPage() {
                                 <VideoCameraIcon className="w-4 h-4" /> Camera
                             </h2>
                             <div className="flex items-center gap-1.5">
-                                {['raw', 'canny', 'unet'].map(mode => (
+                                {['raw', 'canny', 'unet', 'sign', 'all'].map(mode => (
                                     <button key={mode} onClick={() => setCameraMode(mode)}
-                                        className={`px-2 py-1 text-[10px] font-medium rounded transition ${cameraMode === mode ? 'bg-purple-500 text-white' : 'bg-gray-100 text-gray-500 hover:bg-gray-200'}`}>
-                                        {mode === 'raw' ? 'Raw' : mode === 'canny' ? 'Canny' : 'UNet'}
+                                        className={`px-2 py-1 text-[10px] font-medium rounded transition ${cameraMode === mode
+                                                ? mode === 'all' ? 'bg-amber-500 text-white' : 'bg-purple-500 text-white'
+                                                : 'bg-gray-100 text-gray-500 hover:bg-gray-200'
+                                            }`}>
+                                        {{ raw: 'Raw', canny: 'Canny', unet: 'UNet', sign: 'Sign', all: 'All' }[mode]}
                                     </button>
                                 ))}
                                 {cameraOn && (
@@ -430,6 +487,49 @@ export default function MapBuilderPage() {
                             className="w-full px-3 py-2 text-sm bg-purple-50 text-purple-600 rounded-lg border border-purple-200 hover:bg-purple-100 transition mb-3">
                             🔍 Phân tích Canny + UNet
                         </button>
+
+                        {/* Road sign detection */}
+                        <div className="flex gap-2 mb-3">
+                            <button onClick={toggleSignDetection}
+                                className={`flex-1 px-3 py-2 text-sm rounded-lg border transition flex items-center justify-center gap-1.5 ${signDetecting
+                                    ? 'bg-red-50 text-red-600 border-red-200 hover:bg-red-100'
+                                    : 'bg-green-50 text-green-600 border-green-200 hover:bg-green-100'
+                                    }`}>
+                                <EyeIcon className="w-4 h-4" />
+                                {signDetecting ? 'Tắt biển báo' : '🚦 Bật biển báo'}
+                            </button>
+                            <button onClick={handleSignDetectOnce} disabled={signDetecting}
+                                className="px-3 py-2 text-sm bg-amber-50 text-amber-600 rounded-lg border border-amber-200 hover:bg-amber-100 transition disabled:opacity-40">
+                                1 Frame
+                            </button>
+                        </div>
+
+                        {/* Sign detection results */}
+                        {signDetections.length > 0 && (
+                            <div className="p-3 rounded-xl bg-green-50 border border-green-200 mb-3">
+                                <h3 className="text-[10px] font-semibold text-green-600 uppercase tracking-wide mb-2 flex items-center gap-1">
+                                    <EyeIcon className="w-3.5 h-3.5" /> Biển báo phát hiện ({signDetections.length})
+                                </h3>
+                                <div className="space-y-1.5">
+                                    {signDetections.map((d, i) => (
+                                        <div key={i} className="flex items-center justify-between text-xs">
+                                            <span className="font-medium text-gray-700">🚦 {d.class}</span>
+                                            <span className="font-mono text-green-700 font-bold">
+                                                {(d.confidence * 100).toFixed(1)}%
+                                            </span>
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+                        )}
+                        {signDetecting && signDetections.length === 0 && (
+                            <div className="p-2 rounded-xl bg-gray-50 border border-gray-200 mb-3 text-center">
+                                <span className="text-xs text-gray-400 flex items-center justify-center gap-1">
+                                    <span className="w-2 h-2 bg-green-500 rounded-full animate-pulse" />
+                                    Đang quét biển báo...
+                                </span>
+                            </div>
+                        )}
 
                         {/* Analysis result */}
                         {analysis && (
@@ -599,10 +699,11 @@ export default function MapBuilderPage() {
                                     log.includes('❌') ? 'text-red-400' :
                                         log.includes('VIRTUAL') ? 'text-orange-400' :
                                             log.includes('Drift') ? 'text-cyan-300' :
-                                            log.includes('🔄') ? 'text-yellow-300' :
-                                                log.includes('Canny') ? 'text-purple-300' :
-                                                    log.includes('UNet') ? 'text-cyan-300' :
-                                                        log.includes('📸') ? 'text-blue-300' : ''
+                                                log.includes('🔄') ? 'text-yellow-300' :
+                                                    log.includes('Canny') ? 'text-purple-300' :
+                                                        log.includes('UNet') ? 'text-cyan-300' :
+                                                            log.includes('📸') ? 'text-blue-300' :
+                                                                log.includes('🚦') ? 'text-emerald-300' : ''
                                     }`}>
                                     {log}
                                 </div>
@@ -612,6 +713,6 @@ export default function MapBuilderPage() {
                     </div>
                 </div>
             </div>
-        </div>
+        </div >
     );
 }

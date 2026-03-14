@@ -38,8 +38,17 @@ RUN python3 -m venv --system-site-packages /app/hardware/venv && \
 RUN /app/hardware/venv/bin/pip install --no-cache-dir --timeout 600 --retries 5 \
     "torch>=2.0.0" --extra-index-url https://download.pytorch.org/whl/cpu
 
+# Ultralytics YOLO for road sign detection
+RUN /app/hardware/venv/bin/pip install --no-cache-dir --timeout 600 --retries 5 \
+    "ultralytics>=8.0.0" && \
+    /app/hardware/venv/bin/pip install --no-cache-dir --force-reinstall \
+    "opencv-python-headless>=4.8.0"
+
 # Copy U-Net model weights for line-following
 COPY line_following/best_unet.pth ./line_following/best_unet.pth
+
+# Copy YOLO model weights for road sign detection
+COPY detect-road-sign/best_trans.pt ./detect-road-sign/best_trans.pt
 
 # Copy all source code
 COPY . .

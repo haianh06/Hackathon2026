@@ -232,6 +232,42 @@ function setupSocket(io) {
             io.to('admin').emit('motor-calibrate-data', data);
         });
 
+        // Frontend → Hardware: deadband test
+        socket.on('motor-calibrate-deadband', (data) => {
+            io.to('hardware').emit('motor-calibrate-deadband', data);
+        });
+
+        // ====== Road Sign Detection Events ======
+        // Frontend → Hardware: start continuous sign detection
+        socket.on('sign-detect-start', () => {
+            io.to('hardware').emit('sign-detect-start');
+        });
+
+        // Frontend → Hardware: stop sign detection
+        socket.on('sign-detect-stop', () => {
+            io.to('hardware').emit('sign-detect-stop');
+        });
+
+        // Frontend → Hardware: single-frame detection
+        socket.on('sign-detect-once', () => {
+            io.to('hardware').emit('sign-detect-once');
+        });
+
+        // Hardware → Frontend: continuous detection results
+        socket.on('sign-detected', (data) => {
+            io.emit('sign-detected', data);
+        });
+
+        // Hardware → Frontend: detection status (running/stopped)
+        socket.on('sign-detect-status', (data) => {
+            io.emit('sign-detect-status', data);
+        });
+
+        // Hardware → Frontend: single detection result
+        socket.on('sign-detect-result', (data) => {
+            io.emit('sign-detect-result', data);
+        });
+
         socket.on('disconnect', () => {
             console.log(`Client disconnected: ${socket.id}`);
         });

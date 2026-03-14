@@ -18,14 +18,20 @@ export default function MotorCalibrationPage() {
     // Sweep params
     const [sweepStart, setSweepStart] = useState(1300);
     const [sweepEnd, setSweepEnd] = useState(1700);
-    const [sweepStep, setSweepStep] = useState(10);
-    const [sweepHold, setSweepHold] = useState(200);
+    const [sweepStep, setSweepStep] = useState(5);
+    const [sweepHold, setSweepHold] = useState(50);
     const [sweepPin, setSweepPin] = useState('both');
 
     // Step params
     const [stepTarget, setStepTarget] = useState(1800);
     const [stepDuration, setStepDuration] = useState(3);
     const [stepPin, setStepPin] = useState('both');
+
+    // Deadband test params
+    const [dbStep, setDbStep] = useState(1);
+    const [dbHold, setDbHold] = useState(100);
+    const [dbMaxOffset, setDbMaxOffset] = useState(150);
+    const [dbPin, setDbPin] = useState('both');
 
     useEffect(() => {
         socket.emit('join-room', 'admin');
@@ -35,7 +41,7 @@ export default function MotorCalibrationPage() {
                 const next = [...prev, data];
                 return next.length > maxPoints ? next.slice(-maxPoints) : next;
             });
-            if (data.type === 'sweep_done' || data.phase === 'done') {
+            if (data.type === 'sweep_done' || data.type === 'deadband_done' || data.phase === 'done') {
                 setRunning(false);
                 setTestType(null);
             }
@@ -84,6 +90,15 @@ export default function MotorCalibrationPage() {
             pin: stepPin, target_us: stepTarget, duration_s: stepDuration
         });
     }, [stepPin, stepTarget, stepDuration]);
+
+    const startDeadband = useCallback(() => {
+        setChartData([]);
+        setRunning(true);
+        setTestType('deadband');
+        socket.emit('motor-calibrate-deadband', {
+            pin: dbPin, step_us: dbStep, hold_ms: dbHold, max_offset: dbMaxOffset
+        });
+    }, [dbPin, dbStep, dbHold, dbMaxOffset]);
 
     // Chart rendering
     const Chart = ({ data, height = 220 }) => {
@@ -417,6 +432,49 @@ export default function MotorCalibrationPage() {
                         </button>
                     </div>
 
+                    {/* Deadband test */}
+                    <div className="bg-white rounded-2xl border border-gray-200 p-5">
+                        <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wide mb-3">
+                            🎯 Dead Band Test
+                        </h2>
+                        <p className="text-xs text-gray-400 mb-3">
+                            Quét từ 1500µs ra ngoài để tìm chính xác vùng chết (dead zone) — giá trị µs mà motor bắt đầu quay.
+                            Quan sát motor khi nào bắt đầu xoay để xác định ranh giới dead band.
+                        </p>
+
+                        <div className="grid grid-cols-2 gap-2 mb-3">
+                            <div>
+                                <label className="text-xs text-gray-500">Bước (µs)</label>
+                                <input type="number" value={dbStep} onChange={e => setDbStep(+e.target.value)}
+                                    className="w-full border rounded-lg px-2 py-1.5 text-sm" disabled={running} />
+                            </div>
+                            <div>
+                                <label className="text-xs text-gray-500">Giữ (ms)</label>
+                                <input type="number" value={dbHold} onChange={e => setDbHold(+e.target.value)}
+                                    className="w-full border rounded-lg px-2 py-1.5 text-sm" disabled={running} />
+                            </div>
+                            <div>
+                                <label className="text-xs text-gray-500">Offset tối đa (µs)</label>
+                                <input type="number" value={dbMaxOffset} onChange={e => setDbMaxOffset(+e.target.value)}
+                                    className="w-full border rounded-lg px-2 py-1.5 text-sm" disabled={running} />
+                            </div>
+                            <div>
+                                <label className="text-xs text-gray-500">Motor</label>
+                                <select value={dbPin} onChange={e => setDbPin(e.target.value)}
+                                    className="w-full border rounded-lg px-2 py-1.5 text-sm" disabled={running}>
+                                    <option value="both">Cả hai</option>
+                                    <option value="left">Trái (GPIO 12)</option>
+                                    <option value="right">Phải (GPIO 13)</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <button onClick={startDeadband} disabled={running}
+                            className="w-full py-2 bg-purple-500 text-white text-sm font-medium rounded-lg hover:bg-purple-600 transition disabled:opacity-50">
+                            {running && testType === 'deadband' ? '⏳ Đang đo...' : '▶ Đo Dead Band'}
+                        </button>
+                    </div>
+
                     {/* Info card */}
                     <div className="bg-amber-50 rounded-2xl border border-amber-200 p-4">
                         <h3 className="text-sm font-semibold text-amber-700 mb-2">💡 Hướng dẫn</h3>
@@ -425,8 +483,9 @@ export default function MotorCalibrationPage() {
                             <li>• <strong>&gt;1500µs</strong> = Quay tiến (cả 2 bánh)</li>
                             <li>• <strong>&lt;1500µs</strong> = Quay lùi (cả 2 bánh)</li>
                             <li>• Servo trái được tự động đảo xung (gắn đối xứng gương)</li>
-                            <li>• <strong>Sweep</strong>: Quét dải xung để tìm vùng chết</li>
+                            <li>• <strong>Sweep</strong>: Quét dải xung để tìm vùng chết (mặc định 5µs/bước, 50ms/bước)</li>
                             <li>• <strong>Step</strong>: Nhảy đột ngột để đo đáp ứng</li>
+                            <li>• <strong>Dead Band</strong>: Quét từ neutral ra ngoài 1µs/bước để tìm ranh giới chính xác</li>
                             <li>• Quan sát motor vật lý kết hợp biểu đồ</li>
                         </ul>
                     </div>

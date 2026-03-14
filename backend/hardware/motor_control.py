@@ -21,6 +21,7 @@ import logging
 import time
 import math
 import asyncio
+import threading
 
 logger = logging.getLogger('motor_control')
 
@@ -42,6 +43,10 @@ PWM_FREQ = 50       # 50 Hz = standard servo frequency
 STOP_VAL = 1500     # µs - neutral / stop position
 DRIVE_SPEED = 300   # µs - offset from neutral for straight drive
 TURN_SPEED = 200    # µs - offset from neutral for turning
+
+# ─── PWM Ramp Constants ───
+RAMP_STEP_US = 10    # µs per ramp step
+RAMP_STEP_MS = 10    # ms delay between ramp steps
 
 
 class MockMotorController:
@@ -96,6 +101,12 @@ class LgpioPWMController:
         self._claimed = False
         self._h = None
 
+        # PWM ramp state
+        self._current_left_us = STOP_VAL
+        self._current_right_us = STOP_VAL
+        self._ramp_cancel = threading.Event()
+        self._ramp_thread = None
+
         self._init_gpio()
 
     def _init_gpio(self):
@@ -138,33 +149,89 @@ class LgpioPWMController:
         except Exception as e:
             logger.error(f"PWM error on pin {pin}: {e}")
 
+    # ─── PWM Ramping ───
+    def _cancel_ramp(self):
+        """Cancel any running ramp thread"""
+        self._ramp_cancel.set()
+        if self._ramp_thread and self._ramp_thread.is_alive():
+            self._ramp_thread.join(timeout=1.0)
+
+    def _do_ramp(self, left_target, right_target, cancel_event=None):
+        """Ramp both motors from current to target. 10µs/step, 10ms/step.
+        Can run in thread (non-blocking) or directly (blocking)."""
+        left_cur = self._current_left_us
+        right_cur = self._current_right_us
+        left_diff = left_target - left_cur
+        right_diff = right_target - right_cur
+
+        # Tiny change → apply directly
+        if abs(left_diff) <= RAMP_STEP_US and abs(right_diff) <= RAMP_STEP_US:
+            self._set_pwm(self.left_pin, left_target)
+            self._set_pwm(self.right_pin, right_target)
+            self._current_left_us = left_target
+            self._current_right_us = right_target
+            return
+
+        max_steps = max(
+            abs(left_diff) // RAMP_STEP_US,
+            abs(right_diff) // RAMP_STEP_US,
+            1
+        )
+
+        for i in range(1, max_steps + 1):
+            if cancel_event and cancel_event.is_set():
+                return
+            frac = i / max_steps
+            l = int(round(left_cur + left_diff * frac))
+            r = int(round(right_cur + right_diff * frac))
+            self._set_pwm(self.left_pin, l)
+            self._set_pwm(self.right_pin, r)
+            self._current_left_us = l
+            self._current_right_us = r
+            time.sleep(RAMP_STEP_MS / 1000.0)
+
+        # Ensure exact final values
+        self._set_pwm(self.left_pin, left_target)
+        self._set_pwm(self.right_pin, right_target)
+        self._current_left_us = left_target
+        self._current_right_us = right_target
+
+    def _ramp_to(self, left_target, right_target):
+        """Start non-blocking ramp in background thread"""
+        self._cancel_ramp()
+        cancel = threading.Event()
+        self._ramp_cancel = cancel
+        t = threading.Thread(
+            target=self._do_ramp,
+            args=(left_target, right_target, cancel),
+            daemon=True
+        )
+        t.start()
+        self._ramp_thread = t
+
     def forward(self, speed=50):
-        """Both servos rotate forward (fixed direction)"""
+        """Both servos rotate forward with smooth PWM ramp"""
         self.status = 'forward'
-        self._set_pwm(self.left_pin, STOP_VAL - self.drive_speed)
-        self._set_pwm(self.right_pin, STOP_VAL + self.drive_speed)
-        logger.info("Forward: both servos driving forward")
+        self._ramp_to(STOP_VAL - self.drive_speed, STOP_VAL + self.drive_speed)
+        logger.info("Forward: ramping to drive speed")
 
     def backward(self, speed=50):
-        """Both servos rotate backward (fixed direction)"""
+        """Both servos rotate backward with smooth PWM ramp"""
         self.status = 'backward'
-        self._set_pwm(self.left_pin, STOP_VAL + self.drive_speed)
-        self._set_pwm(self.right_pin, STOP_VAL - self.drive_speed)
-        logger.info("Backward: both servos driving backward")
+        self._ramp_to(STOP_VAL + self.drive_speed, STOP_VAL - self.drive_speed)
+        logger.info("Backward: ramping to drive speed")
 
     def turn_left(self, speed=50):
-        """Pivot left: left servo CCW, right servo CCW"""
+        """Pivot left with smooth PWM ramp"""
         self.status = 'turning_left'
-        self._set_pwm(self.left_pin, STOP_VAL - self.turn_speed)
-        self._set_pwm(self.right_pin, STOP_VAL - self.turn_speed)
-        logger.info("Turn Left: pivot (L-CCW, R-CCW)")
+        self._ramp_to(STOP_VAL - self.turn_speed, STOP_VAL - self.turn_speed)
+        logger.info("Turn Left: ramping (pivot)")
 
     def turn_right(self, speed=50):
-        """Pivot right: left servo CW, right servo CW"""
+        """Pivot right with smooth PWM ramp"""
         self.status = 'turning_right'
-        self._set_pwm(self.left_pin, STOP_VAL + self.turn_speed)
-        self._set_pwm(self.right_pin, STOP_VAL + self.turn_speed)
-        logger.info("Turn Right: pivot (L-CW, R-CW)")
+        self._ramp_to(STOP_VAL + self.turn_speed, STOP_VAL + self.turn_speed)
+        logger.info("Turn Right: ramping (pivot)")
 
     def forward_steer(self, correction, speed_factor=1.0):
         """
@@ -202,13 +269,21 @@ class LgpioPWMController:
         self.status = 'forward_steer'
         self._set_pwm(self.left_pin, left_pwm)
         self._set_pwm(self.right_pin, right_pwm)
+        self._current_left_us = int(left_pwm)
+        self._current_right_us = int(right_pwm)
 
     def stop(self):
-        """Stop both servos"""
+        """Stop both servos with smooth ramp-down to neutral"""
         self.status = 'idle'
+        self._cancel_ramp()
+        # Ramp to neutral synchronously (blocking ensures motors actually stop)
+        self._do_ramp(STOP_VAL, STOP_VAL)
+        # Cut PWM signal
         self._set_pwm(self.left_pin, 0)
         self._set_pwm(self.right_pin, 0)
-        logger.info("Stop: both servos stopped")
+        self._current_left_us = STOP_VAL
+        self._current_right_us = STOP_VAL
+        logger.info("Stop: ramped to neutral")
 
     def cleanup(self):
         """Stop motors and release GPIO"""

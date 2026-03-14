@@ -25,7 +25,7 @@ class MJPEGCamera:
     """Read MJPEG frames from rpicam-vid TCP stream on the host."""
 
     def __init__(self, host='host.docker.internal', port=8554,
-                 width=640, height=480, fps=15):
+                 width=1280, height=720, fps=15):
         self.host = host
         self.port = port
         self.width = width
@@ -37,42 +37,55 @@ class MJPEGCamera:
         self._frame_event = asyncio.Event()
         self._running = False
         self._read_task = None
+        self._connect_lock = asyncio.Lock()
+        self._last_connect_attempt = 0
 
     async def start(self):
-        if self._running:
-            return True
-
-        logger.info(f"Connecting to camera stream at {self.host}:{self.port} ...")
-
-        for attempt in range(5):
-            try:
-                self._reader, self._writer = await asyncio.wait_for(
-                    asyncio.open_connection(self.host, self.port),
-                    timeout=5
-                )
-                self._running = True
-                self._read_task = asyncio.ensure_future(self._read_frames())
-                logger.info(f"Camera connected to tcp://{self.host}:{self.port}")
+        async with self._connect_lock:
+            if self._running:
                 return True
-            except Exception as e:
-                logger.warning(f"Camera connect attempt {attempt+1}/5 failed: {e}")
-                await asyncio.sleep(2)
 
-        logger.error(
-            f"Cannot connect to camera stream at {self.host}:{self.port}\n"
-            "Make sure rpicam-vid is running on the host:\n"
-            f"  rpicam-vid --codec mjpeg -t 0 --nopreview "
-            f"--width {self.width} --height {self.height} "
-            f"--framerate {self.fps} --listen "
-            f"-o tcp://0.0.0.0:{self.port}"
-        )
-        return False
+            # Prevent rapid reconnection attempts — wait at least 3s between tries
+            import time
+            now = time.monotonic()
+            since_last = now - self._last_connect_attempt
+            if since_last < 3.0:
+                remaining = 3.0 - since_last
+                logger.debug(f"Camera reconnect throttled, waiting {remaining:.1f}s")
+                await asyncio.sleep(remaining)
+            self._last_connect_attempt = time.monotonic()
+
+            logger.info(f"Connecting to camera stream at {self.host}:{self.port} ...")
+
+            for attempt in range(5):
+                try:
+                    self._reader, self._writer = await asyncio.wait_for(
+                        asyncio.open_connection(self.host, self.port),
+                        timeout=5
+                    )
+                    self._running = True
+                    self._read_task = asyncio.ensure_future(self._read_frames())
+                    logger.info(f"Camera connected to tcp://{self.host}:{self.port}")
+                    return True
+                except Exception as e:
+                    logger.warning(f"Camera connect attempt {attempt+1}/5 failed: {e}")
+                    await asyncio.sleep(2)
+
+            logger.error(
+                f"Cannot connect to camera stream at {self.host}:{self.port}\n"
+                "Make sure rpicam-vid is running on the host:\n"
+                f"  rpicam-vid --codec mjpeg -t 0 --nopreview "
+                f"--width {self.width} --height {self.height} "
+                f"--framerate {self.fps} --listen "
+                f"-o tcp://0.0.0.0:{self.port}"
+            )
+            return False
 
     async def _read_frames(self):
         buf = b''
         try:
             while self._running:
-                chunk = await self._reader.read(65536)
+                chunk = await self._reader.read(262144)
                 if not chunk:
                     logger.warning("Camera TCP stream ended (EOF)")
                     break
@@ -100,10 +113,13 @@ class MJPEGCamera:
             logger.warning("Camera frame reader stopped - will retry on next request")
 
     async def _ensure_connected(self):
-        if not self._running:
-            self._latest_frame = None
-            self._frame_event.clear()
-            await self.start()
+        if self._running:
+            return
+        # Lock is inside start(), so concurrent callers will wait
+        # rather than spawning multiple parallel reconnects
+        self._latest_frame = None
+        self._frame_event.clear()
+        await self.start()
 
     async def get_frame(self):
         await self._ensure_connected()
@@ -151,8 +167,8 @@ class CameraManager:
     def __init__(self, config=None):
         config = config or {}
         cam_cfg = config.get('camera', {})
-        self.width = cam_cfg.get('width', 640)
-        self.height = cam_cfg.get('height', 480)
+        self.width = cam_cfg.get('width', 1280)
+        self.height = cam_cfg.get('height', 720)
         self.fps = cam_cfg.get('fps', 15)
 
         cam_host = os.environ.get('CAMERA_HOST', 'host.docker.internal')

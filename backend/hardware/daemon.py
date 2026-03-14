@@ -53,6 +53,15 @@ except ImportError as e:
     CANNY_AVAILABLE = False
     logger.warning(f"AdaptiveTrackerV2 not available: {e}")
 
+# Import road sign detector
+try:
+    from road_sign_detector import RoadSignDetector
+    SIGN_DETECTOR_AVAILABLE = True
+    logger.info("RoadSignDetector module loaded")
+except ImportError as e:
+    SIGN_DETECTOR_AVAILABLE = False
+    logger.warning(f"RoadSignDetector not available: {e}")
+
 # Socket.IO client
 try:
     import socketio
@@ -126,6 +135,22 @@ class HardwareDaemon:
 
         # ── Motor calibration state ──
         self._calibrate_running = False
+
+        # ── Road sign detection state ──
+        self._sign_detecting = False
+        self._sign_detector = None
+        if SIGN_DETECTOR_AVAILABLE:
+            try:
+                sign_cfg = CONFIG.get('sign_detection', {})
+                self._sign_detector = RoadSignDetector(
+                    conf_threshold=sign_cfg.get('confidence', 0.5)
+                )
+                if self._sign_detector.is_ready:
+                    logger.info("Road sign detector initialized")
+                else:
+                    logger.warning("Road sign detector model not ready")
+            except Exception as e:
+                logger.warning(f"Road sign detector init failed: {e}")
 
     def _calibrate_pwm(self, pin_name, pulse_us):
         """Apply PWM for calibration, inverting left motor around 1500µs.
@@ -339,6 +364,35 @@ class HardwareDaemon:
             self._calibrate_running = False
             self.motor.stop()
 
+        @self.sio.on('motor-calibrate-deadband')
+        async def on_motor_calibrate_deadband(data):
+            """Run a deadband test: sweep outward from neutral to find dead zone."""
+            logger.info("🔧 Calibrate: deadband test requested")
+            self._calibrate_running = True
+            asyncio.ensure_future(self._run_deadband_test(data))
+
+        # ====== Road Sign Detection Commands ======
+        @self.sio.on('sign-detect-start')
+        async def on_sign_detect_start(data=None):
+            """Start continuous road sign detection loop."""
+            logger.info("🚦 Sign detection: start requested")
+            if self._sign_detecting:
+                logger.info("Sign detection already running")
+                return
+            asyncio.ensure_future(self._sign_detect_loop())
+
+        @self.sio.on('sign-detect-stop')
+        async def on_sign_detect_stop(data=None):
+            """Stop road sign detection loop."""
+            logger.info("🚦 Sign detection: stop")
+            self._sign_detecting = False
+
+        @self.sio.on('sign-detect-once')
+        async def on_sign_detect_once(data=None):
+            """Run a single detection on the current frame."""
+            logger.info("🚦 Sign detection: single frame")
+            asyncio.ensure_future(self._sign_detect_single())
+
         try:
             await self.sio.connect(self.server_url)
         except Exception as e:
@@ -354,6 +408,8 @@ class HardwareDaemon:
             'line_follower': self.line_follower.is_ready,
             'canny_available': CANNY_AVAILABLE,
             'rfid_available': RFID_AVAILABLE and self._rfid_reader is not None,
+            'sign_detector_available': SIGN_DETECTOR_AVAILABLE and self._sign_detector is not None and self._sign_detector.is_ready,
+            'sign_detecting': self._sign_detecting,
         }
         if self.sio and self.sio.connected:
             await self.sio.emit('hardware-status', status)
@@ -674,6 +730,155 @@ class HardwareDaemon:
             })
         self._calibrate_running = False
 
+    async def _run_deadband_test(self, data):
+        """Find motor dead band by sweeping outward from 1500µs in small steps.
+        Sweeps forward (1500→1500+max) then reverse (1500→1500-max).
+        User observes when motor starts spinning to determine dead zone edges."""
+        pin = data.get('pin', 'both')
+        step_us = int(data.get('step_us', 1))
+        hold_ms = int(data.get('hold_ms', 100))
+        max_offset = int(data.get('max_offset', 150))
+
+        pin_names = []
+        if pin in ('left', 'both'):
+            pin_names.append('left')
+        if pin in ('right', 'both'):
+            pin_names.append('right')
+
+        t0 = asyncio.get_event_loop().time()
+
+        # Phase 1: Sweep forward (above neutral)
+        for offset in range(0, max_offset + 1, step_us):
+            if not self._calibrate_running:
+                break
+            pulse = 1500 + offset
+            for pname in pin_names:
+                self._calibrate_pwm(pname, pulse)
+            elapsed = asyncio.get_event_loop().time() - t0
+            if self.sio and self.sio.connected:
+                await self.sio.emit('motor-calibrate-data', {
+                    'type': 'deadband', 'pin': pin,
+                    'pulse_us': pulse, 'offset': offset,
+                    'direction': 'forward',
+                    'time': round(elapsed, 3),
+                    'phase': 'forward'
+                })
+            await asyncio.sleep(hold_ms / 1000.0)
+
+        # Return to neutral briefly
+        for pname in pin_names:
+            self._calibrate_pwm(pname, 1500)
+        await asyncio.sleep(0.3)
+
+        # Phase 2: Sweep reverse (below neutral)
+        for offset in range(0, max_offset + 1, step_us):
+            if not self._calibrate_running:
+                break
+            pulse = 1500 - offset
+            for pname in pin_names:
+                self._calibrate_pwm(pname, pulse)
+            elapsed = asyncio.get_event_loop().time() - t0
+            if self.sio and self.sio.connected:
+                await self.sio.emit('motor-calibrate-data', {
+                    'type': 'deadband', 'pin': pin,
+                    'pulse_us': pulse, 'offset': -offset,
+                    'direction': 'reverse',
+                    'time': round(elapsed, 3),
+                    'phase': 'reverse'
+                })
+            await asyncio.sleep(hold_ms / 1000.0)
+
+        # Done
+        self.motor.stop()
+        self._calibrate_running = False
+        if self.sio and self.sio.connected:
+            await self.sio.emit('motor-calibrate-data', {
+                'type': 'deadband_done', 'pin': pin
+            })
+
+    # ====== Road Sign Detection Methods ======
+    async def _sign_detect_loop(self):
+        """Continuously detect road signs from camera frames."""
+        if not self._sign_detector or not self._sign_detector.is_ready:
+            logger.warning("Sign detection requested but detector not ready")
+            if self.sio and self.sio.connected:
+                await self.sio.emit('sign-detect-status', {
+                    'detecting': False,
+                    'error': 'Detector not available',
+                })
+            return
+
+        self._sign_detecting = True
+        if self.sio and self.sio.connected:
+            await self.sio.emit('sign-detect-status', {'detecting': True})
+        logger.info("🚦 Sign detection loop started")
+
+        try:
+            while self._sign_detecting:
+                frame_bytes = await self.camera.get_latest_frame()
+                if frame_bytes is None:
+                    await asyncio.sleep(0.5)
+                    continue
+
+                # Run detection in executor to avoid blocking event loop
+                loop = asyncio.get_event_loop()
+                detections = await loop.run_in_executor(
+                    None, self._sign_detector.detect, frame_bytes
+                )
+
+                if detections and self.sio and self.sio.connected:
+                    import time as _time
+                    await self.sio.emit('sign-detected', {
+                        'detections': detections,
+                        'count': len(detections),
+                        'timestamp': _time.time(),
+                    })
+                    logger.info(f"🚦 Detected {len(detections)} sign(s): "
+                                f"{[d['class'] for d in detections]}")
+
+                # ~3 FPS detection rate to keep CPU manageable on Pi 5
+                await asyncio.sleep(0.33)
+
+        except Exception as e:
+            logger.error(f"Sign detection loop error: {e}")
+        finally:
+            self._sign_detecting = False
+            if self.sio and self.sio.connected:
+                await self.sio.emit('sign-detect-status', {'detecting': False})
+            logger.info("🚦 Sign detection loop stopped")
+
+    async def _sign_detect_single(self):
+        """Run a single detection on the current frame and return annotated image."""
+        if not self._sign_detector or not self._sign_detector.is_ready:
+            if self.sio and self.sio.connected:
+                await self.sio.emit('sign-detect-result', {
+                    'detections': [],
+                    'error': 'Detector not available',
+                })
+            return
+
+        frame_bytes = await self.camera.get_latest_frame()
+        if frame_bytes is None:
+            if self.sio and self.sio.connected:
+                await self.sio.emit('sign-detect-result', {
+                    'detections': [],
+                    'error': 'No camera frame',
+                })
+            return
+
+        loop = asyncio.get_event_loop()
+        detections = await loop.run_in_executor(
+            None, self._sign_detector.detect, frame_bytes
+        )
+
+        import time as _time
+        if self.sio and self.sio.connected:
+            await self.sio.emit('sign-detect-result', {
+                'detections': detections,
+                'count': len(detections),
+                'timestamp': _time.time(),
+            })
+
     # ====== RFID Methods ======
     async def _rfid_scan_loop(self):
         """Continuously poll RFID reader until a tag is found or scan is stopped."""
@@ -883,7 +1088,7 @@ class HardwareDaemon:
                                     # Add position text on viz
                                     pos_text = f"Pos: ({self._map_x},{self._map_y}) Dir: {self._direction_name()}"
                                     _cv2.putText(vis, pos_text, (15, 480 - 30), _cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-                                    _, jpeg = _cv2.imencode('.jpg', vis, [_cv2.IMWRITE_JPEG_QUALITY, 75])
+                                    _, jpeg = _cv2.imencode('.jpg', vis, [_cv2.IMWRITE_JPEG_QUALITY, 90])
                                     frame_bytes = jpeg.tobytes()
                             except Exception as e:
                                 logger.warning(f"Lane overlay error: {e}", exc_info=True)
@@ -897,7 +1102,7 @@ class HardwareDaemon:
                                                      _cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
                                         _cv2.putText(err_frame, str(e)[:60], (15, 65),
                                                      _cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
-                                        _, jpeg = _cv2.imencode('.jpg', err_frame, [_cv2.IMWRITE_JPEG_QUALITY, 75])
+                                        _, jpeg = _cv2.imencode('.jpg', err_frame, [_cv2.IMWRITE_JPEG_QUALITY, 90])
                                         frame_bytes = jpeg.tobytes()
                                 except Exception:
                                     pass
@@ -913,7 +1118,7 @@ class HardwareDaemon:
                                     reason = "Module not loaded" if not CANNY_AVAILABLE else "Detector not initialized"
                                     _cv2.putText(raw_frame, reason, (15, 60),
                                                  _cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
-                                    _, jpeg = _cv2.imencode('.jpg', raw_frame, [_cv2.IMWRITE_JPEG_QUALITY, 75])
+                                    _, jpeg = _cv2.imencode('.jpg', raw_frame, [_cv2.IMWRITE_JPEG_QUALITY, 90])
                                     frame_bytes = jpeg.tobytes()
                             except Exception:
                                 pass
@@ -953,6 +1158,168 @@ class HardwareDaemon:
         cors.add(r_canny_stream.add_route('GET', handle_canny_stream))
         r_canny_snap = cors.add(app.router.add_resource('/canny/snapshot'))
         cors.add(r_canny_snap.add_route('GET', handle_canny_snapshot))
+
+        # ── Unified processed stream (mode via query param) ──
+        async def handle_processed_stream(request):
+            """MJPEG stream with switchable processing: raw|canny|unet|sign|all."""
+            mode = request.query.get('mode', 'raw')
+
+            # Only import cv2 when a processing mode actually needs it
+            _cv2 = None
+            if mode in ('canny', 'sign', 'all'):
+                try:
+                    import cv2 as _cv2
+                except ImportError:
+                    logger.warning("cv2 not available for mode=%s", mode)
+
+            sleep_map = {
+                'raw': 0.07, 'canny': 0.12, 'unet': 0.15,
+                'sign': 0.20, 'all': 0.30,
+            }
+            sleep_time = sleep_map.get(mode, 0.1)
+
+            response = web.StreamResponse(
+                status=200,
+                headers={
+                    'Content-Type': 'multipart/x-mixed-replace; boundary=frame',
+                    'Cache-Control': 'no-cache',
+                },
+            )
+            await response.prepare(request)
+            boundary = b'--frame'
+
+            try:
+                while True:
+                    frame_bytes = await self.camera.get_latest_frame()
+                    if not frame_bytes:
+                        await asyncio.sleep(0.1)
+                        continue
+
+                    jpeg = frame_bytes
+
+                    try:
+                        if mode == 'canny':
+                            if CANNY_AVAILABLE and self._lane_tracker and _cv2:
+                                nparr = np.frombuffer(frame_bytes, np.uint8)
+                                bgr = _cv2.imdecode(nparr, _cv2.IMREAD_COLOR)
+                                if bgr is not None:
+                                    bgr = _cv2.resize(bgr, (640, 480))
+                                    _, vis = self._lane_tracker.process_frame(bgr)
+                                    _, enc = _cv2.imencode(
+                                        '.jpg', vis,
+                                        [_cv2.IMWRITE_JPEG_QUALITY, 90])
+                                    jpeg = enc.tobytes()
+
+                        elif mode == 'unet':
+                            if self.line_follower.is_ready:
+                                debug = self.line_follower.analyse_frame_debug(
+                                    frame_bytes)
+                                jpeg = debug.get('mask_jpeg') or frame_bytes
+
+                        elif mode == 'sign':
+                            if (SIGN_DETECTOR_AVAILABLE
+                                    and self._sign_detector
+                                    and self._sign_detector.is_ready):
+                                _, annotated = \
+                                    self._sign_detector.detect_annotated(
+                                        frame_bytes)
+                                if annotated:
+                                    jpeg = annotated
+
+                        elif mode == 'all' and _cv2:
+                            nparr = np.frombuffer(frame_bytes, np.uint8)
+                            bgr = _cv2.imdecode(nparr, _cv2.IMREAD_COLOR)
+                            if bgr is not None:
+                                bgr = _cv2.resize(bgr, (640, 480))
+
+                                # Re-encode at 640x480 for consistent coords
+                                _, resized_enc = _cv2.imencode(
+                                    '.jpg', bgr,
+                                    [_cv2.IMWRITE_JPEG_QUALITY, 85])
+                                resized_bytes = resized_enc.tobytes()
+
+                                # 1) Canny lane overlay → base visualization
+                                if CANNY_AVAILABLE and self._lane_tracker:
+                                    _, vis = self._lane_tracker.process_frame(
+                                        bgr)
+                                else:
+                                    vis = bgr.copy()
+
+                                # 2) Sign detection bboxes on canny vis
+                                if (SIGN_DETECTOR_AVAILABLE
+                                        and self._sign_detector
+                                        and self._sign_detector.is_ready):
+                                    dets = self._sign_detector.detect(
+                                        resized_bytes)
+                                    for d in dets:
+                                        x1, y1, x2, y2 = d['bbox']
+                                        _cv2.rectangle(
+                                            vis, (x1, y1), (x2, y2),
+                                            (0, 255, 0), 2)
+                                        lbl = (f"{d['class']} "
+                                               f"{d['confidence']:.0%}")
+                                        (tw, th), _ = _cv2.getTextSize(
+                                            lbl,
+                                            _cv2.FONT_HERSHEY_SIMPLEX,
+                                            0.6, 1)
+                                        _cv2.rectangle(
+                                            vis,
+                                            (x1, y1 - th - 8),
+                                            (x1 + tw + 6, y1),
+                                            (0, 255, 0), -1)
+                                        _cv2.putText(
+                                            vis, lbl,
+                                            (x1 + 3, y1 - 5),
+                                            _cv2.FONT_HERSHEY_SIMPLEX,
+                                            0.6, (0, 0, 0), 1)
+
+                                # 3) UNet correction overlay text
+                                if self.line_follower.is_ready:
+                                    dbg = \
+                                        self.line_follower.analyse_frame_debug(
+                                            resized_bytes)
+                                    corr = dbg.get('correction', 0.0)
+                                    conf = dbg.get('confidence', 0.0)
+                                    _cv2.putText(
+                                        vis,
+                                        f"UNet corr={corr:.3f} "
+                                        f"conf={conf:.1%}",
+                                        (15, 25),
+                                        _cv2.FONT_HERSHEY_SIMPLEX,
+                                        0.6, (0, 255, 255), 2)
+
+                                # 4) Mode label
+                                h = vis.shape[0]
+                                _cv2.putText(
+                                    vis, "[ALL] Canny + Sign + UNet",
+                                    (15, h - 15),
+                                    _cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.5, (255, 255, 0), 1)
+
+                                _, enc = _cv2.imencode(
+                                    '.jpg', vis,
+                                    [_cv2.IMWRITE_JPEG_QUALITY, 90])
+                                jpeg = enc.tobytes()
+
+                    except Exception as e:
+                        logger.warning(
+                            "Processed stream (%s) error: %s", mode, e)
+
+                    await response.write(
+                        boundary + b'\r\n'
+                        b'Content-Type: image/jpeg\r\n'
+                        b'Content-Length: '
+                        + str(len(jpeg)).encode() + b'\r\n'
+                        b'\r\n' + jpeg + b'\r\n'
+                    )
+                    await asyncio.sleep(sleep_time)
+            except (ConnectionResetError, asyncio.CancelledError):
+                pass
+            return response
+
+        r_processed = cors.add(
+            app.router.add_resource('/processed/stream'))
+        cors.add(r_processed.add_route('GET', handle_processed_stream))
 
         runner = web.AppRunner(app)
         await runner.setup()
