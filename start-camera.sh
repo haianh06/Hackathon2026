@@ -4,12 +4,12 @@ pkill -f 'rpicam-vid.*tcp://' 2>/dev/null || true
 sleep 1
 
 if command -v rpicam-vid &>/dev/null; then
-    # --quality 90  : JPEG quality (default ~50 rất mờ)
-    # --sharpness 1.5: tăng nét ISP
-    # 1280x720 @15fps: cân bằng nét vs bandwidth
+    # Thêm --mode để ép cảm biến đọc ở độ phân giải cao (góc rộng)
+    # ISP sẽ tự động thu nhỏ (scale down) xuống width 640 x height 480
     rpicam-vid --codec mjpeg -t 0 --nopreview \
-        --width 1280 --height 720 --framerate 15 \
-        --quality 90 --sharpness 1.5 \
+        --mode 1640:1232 \
+        --width 640 --height 480 --framerate 15 \
+        --roi 0,0,1,1 \
         --listen -o tcp://0.0.0.0:8554 &
         
     echo $! > /tmp/rpicam-vid.pid
