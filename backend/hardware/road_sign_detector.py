@@ -14,6 +14,9 @@ import numpy as np
 
 logger = logging.getLogger('road_sign_detector')
 
+# Inference image size — smaller = less CPU. 320 is fine for close-range signs.
+YOLO_IMGSZ = int(os.environ.get('YOLO_IMGSZ', '320'))
+
 MODEL_PATH = os.path.join(
     os.path.dirname(__file__), '..', 'detect-road-sign', 'best_trans.pt'
 )
@@ -83,7 +86,7 @@ class RoadSignDetector:
             if frame is None:
                 return []
 
-            results = self._model(frame, conf=self._conf, verbose=False)
+            results = self._model(frame, conf=self._conf, imgsz=YOLO_IMGSZ, verbose=False)
             detections = []
             for r in results:
                 boxes = r.boxes
@@ -121,7 +124,7 @@ class RoadSignDetector:
             if frame is None:
                 return [], None
 
-            results = self._model(frame, conf=self._conf, verbose=False)
+            results = self._model(frame, conf=self._conf, imgsz=YOLO_IMGSZ, verbose=False)
             detections = []
             for r in results:
                 boxes = r.boxes

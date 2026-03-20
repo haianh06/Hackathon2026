@@ -357,8 +357,6 @@ class AutoNavigator:
 
     # ── Line-following with continuous differential steering ──
     LINE_FOLLOW_INTERVAL  = 0.10     # seconds between camera checks (faster for smoother control)
-    LINE_FOLLOW_GAIN      = 1.0      # proportional gain on correction [-1,1] → steer amount
-    LINE_FOLLOW_D_GAIN    = 0.3      # derivative gain to dampen oscillation
     LINE_FOLLOW_THRESHOLD = 0.03     # min |offset| to trigger any steering (matches dead-zone)
 
     # Stuck detection: if correction stays same sign for too many consecutive frames
@@ -462,14 +460,14 @@ class AutoNavigator:
                     await asyncio.sleep(self.LINE_FOLLOW_INTERVAL)
                     elapsed = time.time() - segment_start
 
-                    # ── Camera line-following with PD control + differential steering ──
+                    # ── Camera line-following with differential steering ──
+                    # LineFollower.analyse_frame() returns a fused canny+unet
+                    # steer value. Canny already has PD+EMA internally, so we
+                    # do NOT apply another PD layer here (avoids double-derivative
+                    # which causes over-correction and oscillation).
                     correction = await self._get_line_correction()
                     if abs(correction) >= self.LINE_FOLLOW_THRESHOLD:
-                        # PD controller
-                        derivative = correction - self._prev_correction
-                        steer = (self.LINE_FOLLOW_GAIN * correction +
-                                 self.LINE_FOLLOW_D_GAIN * derivative)
-                        steer = max(-1.0, min(1.0, steer))
+                        steer = max(-1.0, min(1.0, correction))
 
                         # Apply differential steering (no stop-turn-resume!)
                         self.motor.forward_steer(steer)
@@ -503,7 +501,7 @@ class AutoNavigator:
                                 'timestamp': time.time(),
                             })
 
-                        logger.debug(f"    🔧 steer {steer:+.3f} (P={correction:+.3f} D={derivative:+.3f})")
+                        logger.debug(f"    🔧 steer {steer:+.3f} (correction={correction:+.3f})")
                         await emit_cb('navigation-log', {
                             'type': 'line-correct',
                             'correction': round(correction, 3),

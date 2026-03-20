@@ -13,6 +13,16 @@ import signal
 import logging
 import numpy as np
 
+# ── Limit CPU threads BEFORE importing torch/ultralytics ──
+_max_threads = int(os.environ.get('TORCH_NUM_THREADS', '2'))
+
+try:
+    import torch
+    torch.set_num_threads(_max_threads)
+    torch.set_num_interop_threads(1)
+except ImportError:
+    pass
+
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
@@ -836,8 +846,8 @@ class HardwareDaemon:
                     logger.info(f"🚦 Detected {len(detections)} sign(s): "
                                 f"{[d['class'] for d in detections]}")
 
-                # ~3 FPS detection rate to keep CPU manageable on Pi 5
-                await asyncio.sleep(0.33)
+                # ~2 FPS detection rate to keep CPU manageable on Pi 5
+                await asyncio.sleep(0.5)
 
         except Exception as e:
             logger.error(f"Sign detection loop error: {e}")
@@ -1022,7 +1032,7 @@ class HardwareDaemon:
                             b'Content-Length: ' + str(len(jpeg)).encode() + b'\r\n'
                             b'\r\n' + jpeg + b'\r\n'
                         )
-                    await asyncio.sleep(0.15)
+                    await asyncio.sleep(0.07)
             except (ConnectionResetError, asyncio.CancelledError):
                 pass
             return response
@@ -1130,7 +1140,7 @@ class HardwareDaemon:
                             b'Content-Length: ' + str(len(frame_bytes)).encode() + b'\r\n'
                             b'\r\n' + frame_bytes + b'\r\n'
                         )
-                    await asyncio.sleep(0.12)
+                    await asyncio.sleep(0.07)
             except (ConnectionResetError, asyncio.CancelledError):
                 pass
             return response
@@ -1173,8 +1183,8 @@ class HardwareDaemon:
                     logger.warning("cv2 not available for mode=%s", mode)
 
             sleep_map = {
-                'raw': 0.07, 'canny': 0.12, 'unet': 0.15,
-                'sign': 0.20, 'all': 0.30,
+                'raw': 0.03, 'canny': 0.07, 'unet': 0.10,
+                'sign': 0.15, 'all': 0.20,
             }
             sleep_time = sleep_map.get(mode, 0.1)
 

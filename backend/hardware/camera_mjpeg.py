@@ -34,7 +34,9 @@ class MJPEGCamera:
         self._reader = None
         self._writer = None
         self._latest_frame = None
-        self._frame_event = asyncio.Event()
+        self._frame_id = 0          # monotonic frame counter
+        self._frame_waiters = set() # set of asyncio.Event — one per waiting consumer
+        self._frame_event = asyncio.Event()  # legacy compat for get_frame()
         self._running = False
         self._read_task = None
         self._connect_lock = asyncio.Lock()
@@ -82,28 +84,34 @@ class MJPEGCamera:
             return False
 
     async def _read_frames(self):
-        buf = b''
+        buf = bytearray()
         try:
             while self._running:
                 chunk = await self._reader.read(262144)
                 if not chunk:
                     logger.warning("Camera TCP stream ended (EOF)")
                     break
-                buf += chunk
+                buf.extend(chunk)
 
                 while True:
                     soi = buf.find(_SOI)
                     if soi == -1:
-                        buf = b''
+                        buf.clear()
                         break
                     eoi = buf.find(_EOI, soi + 2)
                     if eoi == -1:
-                        buf = buf[soi:]
+                        # discard data before SOI to keep buffer small
+                        if soi > 0:
+                            del buf[:soi]
                         break
-                    frame = buf[soi:eoi + 2]
-                    buf = buf[eoi + 2:]
+                    frame = bytes(buf[soi:eoi + 2])
+                    del buf[:eoi + 2]
                     self._latest_frame = frame
+                    self._frame_id += 1
                     self._frame_event.set()
+                    # Wake all stream consumers waiting for a new frame
+                    for evt in self._frame_waiters:
+                        evt.set()
         except asyncio.CancelledError:
             pass
         except Exception as e:
@@ -150,6 +158,23 @@ class MJPEGCamera:
         self._frame_event.clear()
         logger.info("Camera stopped")
 
+    async def wait_new_frame(self, last_id=0, timeout=5.0):
+        """Wait until a new frame arrives (frame_id > last_id).
+        Returns (frame_bytes, frame_id) or (None, last_id) on timeout."""
+        # If a newer frame is already available, return immediately
+        if self._frame_id > last_id and self._latest_frame is not None:
+            return self._latest_frame, self._frame_id
+        # Register a per-consumer event and wait for notification
+        evt = asyncio.Event()
+        self._frame_waiters.add(evt)
+        try:
+            await asyncio.wait_for(evt.wait(), timeout=timeout)
+            return self._latest_frame, self._frame_id
+        except asyncio.TimeoutError:
+            return None, last_id
+        finally:
+            self._frame_waiters.discard(evt)
+
     @property
     def is_running(self):
         return self._running
@@ -187,17 +212,26 @@ class CameraManager:
                 'Content-Type': 'multipart/x-mixed-replace; boundary=frame',
                 'Cache-Control': 'no-cache, no-store, must-revalidate',
                 'Pragma': 'no-cache',
+                'X-Accel-Buffering': 'no',
             },
         )
         await response.prepare(request)
 
         boundary = b'--frame'
+        cam = self._camera
+        last_id = 0
         try:
             while True:
-                frame = await self._camera.get_frame()
+                # Ensure camera is connected
+                await cam._ensure_connected()
+                # Block until a genuinely NEW frame arrives — no polling, no sleep
+                frame, fid = await cam.wait_new_frame(last_id=last_id, timeout=5.0)
                 if frame is None:
-                    await asyncio.sleep(0.2)
                     continue
+                if fid == last_id:
+                    # Timeout without new frame — loop and retry
+                    continue
+                last_id = fid
                 await response.write(
                     boundary + b'\r\n'
                     b'Content-Type: image/jpeg\r\n'
@@ -205,7 +239,6 @@ class CameraManager:
                     b'\r\n' +
                     frame + b'\r\n'
                 )
-                await asyncio.sleep(1.0 / self.fps)
         except (ConnectionResetError, asyncio.CancelledError):
             pass
         return response

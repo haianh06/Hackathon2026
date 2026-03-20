@@ -16,9 +16,17 @@ class HardwareService extends EventEmitter {
     }
 
     /**
-     * Start the Python hardware daemon as a child process
+     * Start the Python hardware daemon as a child process.
+     * When HARDWARE_DOCKER=true, the daemon runs as a separate Docker container
+     * and we skip spawning it here.
      */
     startDaemon() {
+        if (process.env.HARDWARE_DOCKER === 'true') {
+            console.log('🐳 Hardware daemon running as separate Docker container — skipping spawn');
+            this.isRunning = true;
+            return;
+        }
+
         if (this.daemonProcess) {
             console.log('Hardware daemon already running');
             return;

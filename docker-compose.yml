@@ -44,9 +44,32 @@ services:
       dockerfile: Dockerfile
     container_name: hackathon-backend
     restart: unless-stopped
-    privileged: true
     ports:
       - "5000:5000"
+    environment:
+      PORT: 5000
+      MONGODB_URI: mongodb://admin:admin123@mongodb:27017/delivery_bot?authSource=admin
+      REDIS_URL: redis://redis:6379
+      NODE_ENV: production
+      ENABLE_HARDWARE: "true"
+      HARDWARE_DOCKER: "true"
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - app-network
+
+  # ===== Hardware Daemon (Python - motor, camera, YOLO) =====
+  hardware:
+    build:
+      context: ./backend
+      dockerfile: hardware/Dockerfile
+    container_name: hackathon-hardware
+    restart: unless-stopped
+    privileged: true
+    ports:
       - "8765:8765"
     devices:
       - /dev/gpiochip0:/dev/gpiochip0
@@ -57,18 +80,17 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
-      PORT: 5000
-      MONGODB_URI: mongodb://admin:admin123@mongodb:27017/delivery_bot?authSource=admin
-      REDIS_URL: redis://redis:6379
-      NODE_ENV: production
-      ENABLE_HARDWARE: "true"
+      SERVER_URL: http://backend:5000
       CAMERA_HOST: host.docker.internal
       CAMERA_PORT: "8554"
+      # Thread limits to prevent CPU overload
+      OMP_NUM_THREADS: "2"
+      MKL_NUM_THREADS: "2"
+      OPENBLAS_NUM_THREADS: "2"
+      TORCH_NUM_THREADS: "2"
+      PYTHONUNBUFFERED: "1"
     depends_on:
-      mongodb:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
+      - backend
     networks:
       - app-network
 
@@ -87,6 +109,7 @@ services:
       - "3000:3000"
     depends_on:
       - backend
+      - hardware
     networks:
       - app-network
 

@@ -124,6 +124,15 @@ EXPECTED_LANE_FRAC_MAX = 0.60   # lane is at most 60% of image width
 # Minimum white pixels to consider the mask valid
 MIN_WHITE_PIXELS = 50
 
+# ── Canny + UNet fusion thresholds ──
+# UNet offset tells how far the lane center is from the frame center.
+# When offset exceeds warn threshold, we start blending UNet correction into
+# canny steer to pull the car back toward the lane center.
+UNET_WARN_THRESHOLD = 0.25       # start blending when 25% off-center
+UNET_EMERGENCY_THRESHOLD = 0.55  # hard override when 55% off-center
+UNET_BLEND_GAIN = 0.5            # max blending weight for UNet in warning zone
+UNET_EMERGENCY_GAIN = 1.2        # multiplier for emergency override steer
+
 
 class LineFollower:
     """
@@ -284,20 +293,36 @@ class LineFollower:
                 roi = mask[roi_top:, :]
                 unet_raw = self._lane_gap_offset(roi)
 
-            # ── Decide final steering ──
+            # ── Decide final steering: canny (primary) + unet (centering) ──
+            abs_unet = abs(unet_raw)
+
             if canny_steer is not None:
-                # Trust canny's Point of Orientation steering directly.
-                # Canny already applies its own PD controller + EMA filter,
-                # so we do NOT apply additional EMA smoothing here to avoid
-                # double-smoothing which causes sluggish response.
+                # Canny = primary steer (already has PD + EMA internally)
                 raw = canny_steer
 
-                # UNet safety override: white border dangerously close
-                if abs(unet_raw) > 0.7:
-                    raw = -0.5 * np.sign(unet_raw)
+                # UNet gradual centerline correction:
+                # unet_raw > 0 → lane center is RIGHT → car drifting LEFT → steer RIGHT
+                # unet_raw < 0 → lane center is LEFT  → car drifting RIGHT → steer LEFT
+                # As offset grows, blend UNet correction progressively.
+                if abs_unet > UNET_EMERGENCY_THRESHOLD:
+                    # EMERGENCY: car about to cross white line → hard steer toward center
+                    raw = float(np.clip(unet_raw * UNET_EMERGENCY_GAIN, -1.0, 1.0))
                     logger.warning(
-                        f"UNET EMERGENCY: white line near centre! "
+                        f"UNET EMERGENCY: off-center {abs_unet:.0%}! "
                         f"canny={canny_steer:+.3f} unet={unet_raw:+.3f} → override={raw:+.3f}"
+                    )
+                elif abs_unet > UNET_WARN_THRESHOLD:
+                    # WARNING ZONE: gradually blend UNet correction into canny steer
+                    # blend ramps from 0 at warn threshold to UNET_BLEND_GAIN at emergency
+                    blend = ((abs_unet - UNET_WARN_THRESHOLD) /
+                             (UNET_EMERGENCY_THRESHOLD - UNET_WARN_THRESHOLD))
+                    blend = min(blend, 1.0) * UNET_BLEND_GAIN
+                    # Weighted mix: (1-blend)*canny + blend*unet_correction
+                    raw = (1.0 - blend) * canny_steer + blend * unet_raw
+                    raw = float(np.clip(raw, -1.0, 1.0))
+                    logger.debug(
+                        f"UNET BLEND: off-center {abs_unet:.0%}, blend={blend:.2f} "
+                        f"canny={canny_steer:+.3f} unet={unet_raw:+.3f} → raw={raw:+.3f}"
                     )
 
                 # No extra EMA — canny output is already smoothed
