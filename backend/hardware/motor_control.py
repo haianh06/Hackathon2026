@@ -597,6 +597,13 @@ class AutoNavigator:
         """Execute a pivot turn."""
         if direction == 'straight':
             return
+
+        # Unlock canny ROI before turning — car will be on a different lane
+        if (self._line_follower and self._line_follower._canny_available
+                and self._line_follower._canny_detector is not None):
+            self._line_follower._canny_detector.unlock_roi()
+            logger.info("  🔓 Canny ROI unlocked for turn")
+
         t = self.TURN_90_TIME * self.TURN_CORRECTION
         if direction == 'uturn':
             t *= 2

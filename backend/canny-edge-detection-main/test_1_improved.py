@@ -26,20 +26,39 @@ class AdaptiveTrackerV2:
         # ==========================================
         self.camera_x_offset = 0    
         
-        # ĐẨY ROI RA XA XE HƠN (Giá trị càng nhỏ càng xa xe)
-        self.y_bottom = int(self.h * 0.85) # Cạnh dưới của thang (đã đẩy xa hơn so với 0.95 cũ)
-        self.y_top = int(self.h * 0.40)    # Cạnh trên của thang (đẩy xa lên mốc 40% ảnh)
+        # ROI gần xe hơn — nhìn khoảng 25% chiều cao phía trước
+        self.y_bottom = int(self.h * 0.85)  # Cạnh dưới (gần xe)
+        self.y_top    = int(self.h * 0.60)  # Cạnh trên (rút ngắn từ 0.40 → 0.60)
         
-        self.num_scans = 8  # Số lượng vạch gióng ngang quét trong ROI
+        self.num_scans = 12  # Giảm từ 8 → 6 vì ROI ngắn hơn
         self.standard_lane_width = int(self.w * 0.6) 
         
         # Trạng thái ROI ban đầu
-        self.roi_x = np.array([self.w*0.2, self.w*0.8, self.w*0.35, self.w*0.65], dtype=np.float32)
+        self.roi_x = np.array([self.w*0.15, self.w*0.85, self.w*0.30, self.w*0.70], dtype=np.float32)
         self.roi_ema_alpha = 0.2 
 
+        # PID controller (thêm Ki cho tích phân)
         self.Kp = 0.85
+        self.Ki = 0.05
         self.Kd = 0.60
+        self._integral = 0.0
+        self._integral_max = 2.0  # Anti-windup clamp
         self.steer_ema = EMAFilter(alpha=0.3)
+
+        # ==========================================
+        # Baseline calibration — đường ngang đáy ROI
+        # Nơi mà 2 vạch trắng cân bằng nhau
+        # ==========================================
+        self.baseline_y = self.y_bottom  # Vị trí baseline = đáy ROI
+        self.baseline_balance = 0.0      # Độ lệch tại baseline (-1..+1)
+
+        # ==========================================
+        # Intersection ROI locking
+        # ==========================================
+        self.roi_locked = False           # True khi đã lock ROI tại ngã rẽ
+        self.locked_y_top = None          # y_top cố định khi lock
+        self.locked_roi_x = None          # ROI x cố định khi lock
+        self._intersection_cooldown = 0   # Frame cooldown sau khi unlock
 
     def _get_clean_mask(self, bgr_img: np.ndarray) -> np.ndarray:
         gray = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2GRAY)
@@ -65,16 +84,59 @@ class AdaptiveTrackerV2:
             
         return start + l_edge_local, start + r_edge_local
 
+    def _detect_intersection(self, mask: np.ndarray) -> Optional[int]:
+        """Detect horizontal white line (intersection) above the ROI.
+
+        Scans rows from y_top upward looking for a row with a wide
+        continuous white segment spanning >40% of frame width.
+        Returns the y coordinate of that line, or None.
+        """
+        scan_start = max(0, self.y_top - 80)
+        for y in range(self.y_top, scan_start, -2):
+            row = mask[y, :]
+            white_ratio = np.count_nonzero(row) / self.w
+            if white_ratio > 0.40:
+                return y
+        return None
+
+    def unlock_roi(self):
+        """Unlock a previously locked ROI (call after completing a turn)."""
+        self.roi_locked = False
+        self.locked_y_top = None
+        self.locked_roi_x = None
+        self._intersection_cooldown = 15  # Skip detection for 15 frames
+
     def process_frame(self, frame: np.ndarray):
         mask = self._get_clean_mask(frame)
         viz_frame = frame.copy()
         car_center_x = (self.w // 2) + self.camera_x_offset
 
-        l_bot_exp, r_bot_exp, l_top_exp, r_top_exp = self.roi_x
-        y_steps = np.linspace(self.y_bottom, self.y_top, self.num_scans, dtype=int)
+        # ── Intersection ROI locking ──
+        active_y_top = self.y_top
+        active_roi_x = self.roi_x.copy()
+
+        if self.roi_locked and self.locked_y_top is not None:
+            # ROI đã lock → dùng giá trị cố định
+            active_y_top = self.locked_y_top
+            active_roi_x = self.locked_roi_x.copy()
+        else:
+            # Kiểm tra ngã rẽ
+            if self._intersection_cooldown > 0:
+                self._intersection_cooldown -= 1
+            else:
+                intersection_y = self._detect_intersection(mask)
+                if intersection_y is not None:
+                    # Lock ROI — đỉnh chạm vạch trắng ngang
+                    self.roi_locked = True
+                    self.locked_y_top = intersection_y
+                    self.locked_roi_x = self.roi_x.copy()
+                    active_y_top = intersection_y
+
+        l_bot_exp, r_bot_exp, l_top_exp, r_top_exp = active_roi_x
+        y_steps = np.linspace(self.y_bottom, active_y_top, self.num_scans, dtype=int)
         
         valid_l_pts, valid_r_pts = [], []
-        center_path_pts = [] # Lưu các điểm trung tâm (chấm đỏ) để vẽ xương sống
+        center_path_pts = []
         
         # Màu sắc hiển thị
         COLOR_OUTER = (150, 0, 0)   # Xanh sẫm (rìa ngoài)
@@ -85,8 +147,11 @@ class AdaptiveTrackerV2:
         # ==========================================
         # BƯỚC 1: QUÉT TÌM CẠNH, ĐIỂM VÀ VẼ LƯỚI
         # ==========================================
+        baseline_l_mid = None
+        baseline_r_mid = None
+
         for y in y_steps:
-            ratio = (self.y_bottom - y) / (self.y_bottom - self.y_top + 1e-5)
+            ratio = (self.y_bottom - y) / (self.y_bottom - active_y_top + 1e-5)
             exp_l = int(l_bot_exp + ratio * (l_top_exp - l_bot_exp))
             exp_r = int(r_bot_exp + ratio * (r_top_exp - r_bot_exp))
             
@@ -99,45 +164,66 @@ class AdaptiveTrackerV2:
 
             # Xử lý vạch trái
             if l_edges:
-                l_out, l_in = l_edges # Rìa ngoài và rìa trong của vạch trái
+                l_out, l_in = l_edges
                 l_mid_val = (l_out + l_in) // 2
                 valid_l_pts.append((y, l_mid_val))
-                
-                # Nối rìa trong - rìa ngoài bằng nét màu xanh lá
                 cv2.line(viz_frame, (l_out, y), (l_in, y), (0, 255, 0), 2)
-                # Vẽ các chấm
                 cv2.circle(viz_frame, (l_out, y), 3, COLOR_OUTER, -1)
                 cv2.circle(viz_frame, (l_in, y), 3, COLOR_INNER, -1)
                 cv2.circle(viz_frame, (l_mid_val, y), 3, COLOR_MID, -1)
 
             # Xử lý vạch phải
             if r_edges:
-                r_in, r_out = r_edges # Rìa trong và rìa ngoài của vạch phải
+                r_in, r_out = r_edges
                 r_mid_val = (r_in + r_out) // 2
                 valid_r_pts.append((y, r_mid_val))
-                
-                # Nối rìa trong - rìa ngoài bằng nét màu xanh lá
                 cv2.line(viz_frame, (r_in, y), (r_out, y), (0, 255, 0), 2)
-                # Vẽ các chấm
                 cv2.circle(viz_frame, (r_in, y), 3, COLOR_INNER, -1)
                 cv2.circle(viz_frame, (r_out, y), 3, COLOR_OUTER, -1)
                 cv2.circle(viz_frame, (r_mid_val, y), 3, COLOR_MID, -1)
 
-            # Dự đoán nếu thiếu 1 bên (giúp vẽ lưới đều)
+            # Lưu giá trị tại baseline (scan line gần y_bottom nhất)
+            if y == y_steps[0]:  # y_steps[0] = y_bottom
+                baseline_l_mid = l_mid_val
+                baseline_r_mid = r_mid_val
+
+            # Dự đoán nếu thiếu 1 bên
             if l_mid_val is not None and r_mid_val is None:
                 r_mid_val = l_mid_val + self.standard_lane_width
             elif r_mid_val is not None and l_mid_val is None:
                 l_mid_val = r_mid_val - self.standard_lane_width
 
-            # Nếu có cả 2 bên (thực tế hoặc dự đoán), vẽ đường gióng và tâm
             if l_mid_val is not None and r_mid_val is not None:
-                # 1. Đường gióng ngang (màu tím) nối 2 vạch kẻ
                 cv2.line(viz_frame, (l_mid_val, y), (r_mid_val, y), (200, 100, 200), 1)
-                
-                # 2. Điểm tâm giữa làn đường
                 center_x = (l_mid_val + r_mid_val) // 2
                 center_path_pts.append((center_x, y))
-                cv2.circle(viz_frame, (center_x, y), 4, COLOR_CENTER, -1) # Chấm đỏ giữa
+                cv2.circle(viz_frame, (center_x, y), 4, COLOR_CENTER, -1)
+
+        # ==========================================
+        # BASELINE — đường ngang đáy ROI để căn chỉnh camera
+        # ==========================================
+        # Vẽ đường baseline (đáy ROI) cắt ngang ảnh
+        cv2.line(viz_frame, (0, self.y_bottom), (self.w, self.y_bottom), (255, 100, 255), 2)
+
+        # Tính độ cân bằng tại baseline
+        if baseline_l_mid is not None and baseline_r_mid is not None:
+            dist_l = car_center_x - baseline_l_mid   # Khoảng cách vạch trái → tâm xe
+            dist_r = baseline_r_mid - car_center_x   # Khoảng cách tâm xe → vạch phải
+            total = dist_l + dist_r if (dist_l + dist_r) > 0 else 1
+            self.baseline_balance = (dist_r - dist_l) / total  # -1=lệch phải, +1=lệch trái
+            bal_color = (0, 255, 0) if abs(self.baseline_balance) < 0.1 else (0, 165, 255)
+            cv2.putText(viz_frame, f"BAL: {self.baseline_balance:+.2f}",
+                        (10, self.y_bottom - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, bal_color, 2)
+            # Vẽ marker cân bằng tại baseline
+            cv2.circle(viz_frame, (car_center_x, self.y_bottom), 5, (255, 100, 255), -1)
+            if baseline_l_mid:
+                cv2.circle(viz_frame, (baseline_l_mid, self.y_bottom), 5, (0, 0, 255), -1)
+            if baseline_r_mid:
+                cv2.circle(viz_frame, (baseline_r_mid, self.y_bottom), 5, (255, 0, 0), -1)
+        else:
+            self.baseline_balance = 0.0
+            cv2.putText(viz_frame, "BAL: N/A",
+                        (10, self.y_bottom - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (128, 128, 128), 2)
 
         # ==========================================
         # BƯỚC 2: HỒI QUY XÁC ĐỊNH CẠNH CỦA ROI THANG
@@ -161,47 +247,73 @@ class AdaptiveTrackerV2:
         is_tracking = False
         if poly_l is not None and poly_r is not None:
             is_tracking = True
-            target_l_bot, target_l_top = poly_l(self.y_bottom), poly_l(self.y_top)
-            target_r_bot, target_r_top = poly_r(self.y_bottom), poly_r(self.y_top)
+            target_l_bot = poly_l(self.y_bottom)
+            target_l_top = poly_l(active_y_top)
+            target_r_bot = poly_r(self.y_bottom)
+            target_r_top = poly_r(active_y_top)
             
             new_target = np.array([target_l_bot, target_r_bot, target_l_top, target_r_top], dtype=np.float32)
-            self.roi_x = (self.roi_ema_alpha * new_target) + ((1 - self.roi_ema_alpha) * self.roi_x)
 
-        curr_l_bot, curr_r_bot, curr_l_top, curr_r_top = map(int, self.roi_x)
+            if not self.roi_locked:
+                # ROI tự do → cập nhật EMA
+                self.roi_x = (self.roi_ema_alpha * new_target) + ((1 - self.roi_ema_alpha) * self.roi_x)
+                active_roi_x = self.roi_x.copy()
+            # Nếu locked, giữ nguyên active_roi_x
+
+        curr_l_bot, curr_r_bot, curr_l_top, curr_r_top = map(int, active_roi_x)
 
         # ==========================================
         # BƯỚC 3: VẼ KHUNG ROI VÀ ĐƯỜNG ĐỊNH HƯỚNG
         # ==========================================
-        # Vẽ khung thang (cạnh ngoài cùng)
-        trap_pts = np.array([[curr_l_bot, self.y_bottom], [curr_l_top, self.y_top], 
-                             [curr_r_top, self.y_top], [curr_r_bot, self.y_bottom]], np.int32)
-        cv2.polylines(viz_frame, [trap_pts], True, (0, 0, 255), 3) # Vạch đỏ đậm bọc ngoài
+        roi_color = (0, 200, 255) if self.roi_locked else (0, 0, 255)
+        trap_pts = np.array([[curr_l_bot, self.y_bottom], [curr_l_top, active_y_top], 
+                             [curr_r_top, active_y_top], [curr_r_bot, self.y_bottom]], np.int32)
+        cv2.polylines(viz_frame, [trap_pts], True, roi_color, 3)
 
-        # Vẽ xương sống lượn sóng (nối các tâm thực tế tìm được)
+        # Nếu locked, vẽ nhãn LOCKED
+        if self.roi_locked:
+            cv2.putText(viz_frame, "ROI LOCKED", (self.w - 200, active_y_top - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
+
+        # Vẽ xương sống lượn sóng
         if len(center_path_pts) > 1:
             for i in range(len(center_path_pts) - 1):
                 cv2.line(viz_frame, center_path_pts[i], center_path_pts[i+1], COLOR_MID, 2)
                 
-        # Vẽ Point of Orientation (Tâm trên cùng) nối về xe
+        # Point of Orientation
         mid_bot_x = (curr_l_bot + curr_r_bot) // 2
         mid_top_x = (curr_l_top + curr_r_top) // 2
         
-        # Đường thẳng từ Point of Orientation xuống đuôi
-        cv2.line(viz_frame, (mid_top_x, self.y_top), (car_center_x, self.h), (0, 255, 255), 2)
-        
-        # Đánh dấu Point of Orientation
-        cv2.circle(viz_frame, (mid_top_x, self.y_top), 6, COLOR_CENTER, -1)
+        cv2.line(viz_frame, (mid_top_x, active_y_top), (car_center_x, self.h), (0, 255, 255), 2)
+        cv2.circle(viz_frame, (mid_top_x, active_y_top), 6, COLOR_CENTER, -1)
 
-        # Tính toán vô lăng
+        # ==========================================
+        # BƯỚC 4: PID CONTROLLER
+        # ==========================================
         e_offset = (mid_bot_x - car_center_x) / (self.w / 2.0)
         e_heading = (mid_top_x - mid_bot_x) / (self.w / 2.0)
-        raw_steer = np.clip((self.Kp * e_offset) + (self.Kd * e_heading), -1.0, 1.0)
+
+        # Tích phân (anti-windup clamp)
+        self._integral += e_offset
+        self._integral = np.clip(self._integral, -self._integral_max, self._integral_max)
+
+        raw_steer = np.clip(
+            (self.Kp * e_offset) + (self.Ki * self._integral) + (self.Kd * e_heading),
+            -1.0, 1.0
+        )
         steer_final = self.steer_ema.update(raw_steer)
         
         # Hiển thị text
-        status = "VIRTUAL ROI: HOLDING SHAPE!" if is_tracking else "VIRTUAL ROI: PREDICTING"
+        if self.roi_locked:
+            status = "ROI LOCKED (intersection)"
+        elif is_tracking:
+            status = "TRACKING"
+        else:
+            status = "PREDICTING"
         cv2.putText(viz_frame, f"STEER: {steer_final:+.3f}", (150, 40), cv2.FONT_HERSHEY_DUPLEX, 1, (255, 255, 255), 2)
-        cv2.putText(viz_frame, status, (150, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        cv2.putText(viz_frame, status, (150, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, roi_color, 2)
+        cv2.putText(viz_frame, f"PID: P={e_offset:+.2f} I={self._integral:+.2f} D={e_heading:+.2f}",
+                    (10, self.h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
             
         return steer_final, viz_frame
 

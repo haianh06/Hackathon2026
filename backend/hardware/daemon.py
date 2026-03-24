@@ -13,16 +13,6 @@ import signal
 import logging
 import numpy as np
 
-# ── Limit CPU threads BEFORE importing torch/ultralytics ──
-_max_threads = int(os.environ.get('TORCH_NUM_THREADS', '2'))
-
-try:
-    import torch
-    torch.set_num_threads(_max_threads)
-    torch.set_num_interop_threads(1)
-except ImportError:
-    pass
-
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
@@ -62,15 +52,6 @@ try:
 except ImportError as e:
     CANNY_AVAILABLE = False
     logger.warning(f"AdaptiveTrackerV2 not available: {e}")
-
-# Import road sign detector
-try:
-    from road_sign_detector import RoadSignDetector
-    SIGN_DETECTOR_AVAILABLE = True
-    logger.info("RoadSignDetector module loaded")
-except ImportError as e:
-    SIGN_DETECTOR_AVAILABLE = False
-    logger.warning(f"RoadSignDetector not available: {e}")
 
 # Socket.IO client
 try:
@@ -132,6 +113,10 @@ class HardwareDaemon:
             except Exception as e:
                 logger.warning(f"RFID reader init failed: {e}")
 
+        # ── Road sign detection overlay state ──
+        self._sign_detections = []   # latest [{class, confidence, bbox}]
+        self._sign_ts = 0            # timestamp of last detection
+
         # ── Drift correction state ──
         self._drift_history = []       # list of (steer, duration) tuples
         self._drift_bias = 0.0         # accumulated servo bias offset
@@ -145,22 +130,6 @@ class HardwareDaemon:
 
         # ── Motor calibration state ──
         self._calibrate_running = False
-
-        # ── Road sign detection state ──
-        self._sign_detecting = False
-        self._sign_detector = None
-        if SIGN_DETECTOR_AVAILABLE:
-            try:
-                sign_cfg = CONFIG.get('sign_detection', {})
-                self._sign_detector = RoadSignDetector(
-                    conf_threshold=sign_cfg.get('confidence', 0.5)
-                )
-                if self._sign_detector.is_ready:
-                    logger.info("Road sign detector initialized")
-                else:
-                    logger.warning("Road sign detector model not ready")
-            except Exception as e:
-                logger.warning(f"Road sign detector init failed: {e}")
 
     def _calibrate_pwm(self, pin_name, pulse_us):
         """Apply PWM for calibration, inverting left motor around 1500µs.
@@ -295,6 +264,14 @@ class HardwareDaemon:
                 'timestamp': __import__('time').time(),
             })
 
+        @self.sio.on('vehicle-returned')
+        async def on_vehicle_returned(data=None):
+            logger.info("🔄 Vehicle returned — resetting heading and canny ROI")
+            self.navigator.heading = None
+            self.navigator._prev_correction = 0.0
+            if self.navigator._line_follower:
+                self.navigator._line_follower.reset()
+
         @self.sio.on('hardware-status-request')
         async def on_status_request(data):
             await self.report_status()
@@ -337,6 +314,22 @@ class HardwareDaemon:
             asyncio.ensure_future(self._map_build_analyse())
 
         # ====== Motor Calibration Commands ======
+        # ====== Road Sign Detection Overlay ======
+        @self.sio.on('sign-detected')
+        async def on_sign_detected(data):
+            self._sign_detections = data.get('detections', [])
+            self._sign_ts = __import__('time').time()
+
+        @self.sio.on('sign-detect-result')
+        async def on_sign_detect_result(data):
+            self._sign_detections = data.get('detections', [])
+            self._sign_ts = __import__('time').time()
+
+        @self.sio.on('sign-detect-status')
+        async def on_sign_detect_status(data):
+            if not data.get('detecting', False):
+                self._sign_detections = []
+
         @self.sio.on('motor-calibrate-set')
         async def on_motor_calibrate_set(data):
             """Set PWM pulse width on a specific motor pin (auto-inverts left)."""
@@ -381,28 +374,6 @@ class HardwareDaemon:
             self._calibrate_running = True
             asyncio.ensure_future(self._run_deadband_test(data))
 
-        # ====== Road Sign Detection Commands ======
-        @self.sio.on('sign-detect-start')
-        async def on_sign_detect_start(data=None):
-            """Start continuous road sign detection loop."""
-            logger.info("🚦 Sign detection: start requested")
-            if self._sign_detecting:
-                logger.info("Sign detection already running")
-                return
-            asyncio.ensure_future(self._sign_detect_loop())
-
-        @self.sio.on('sign-detect-stop')
-        async def on_sign_detect_stop(data=None):
-            """Stop road sign detection loop."""
-            logger.info("🚦 Sign detection: stop")
-            self._sign_detecting = False
-
-        @self.sio.on('sign-detect-once')
-        async def on_sign_detect_once(data=None):
-            """Run a single detection on the current frame."""
-            logger.info("🚦 Sign detection: single frame")
-            asyncio.ensure_future(self._sign_detect_single())
-
         try:
             await self.sio.connect(self.server_url)
         except Exception as e:
@@ -418,8 +389,6 @@ class HardwareDaemon:
             'line_follower': self.line_follower.is_ready,
             'canny_available': CANNY_AVAILABLE,
             'rfid_available': RFID_AVAILABLE and self._rfid_reader is not None,
-            'sign_detector_available': SIGN_DETECTOR_AVAILABLE and self._sign_detector is not None and self._sign_detector.is_ready,
-            'sign_detecting': self._sign_detecting,
         }
         if self.sio and self.sio.connected:
             await self.sio.emit('hardware-status', status)
@@ -549,6 +518,11 @@ class HardwareDaemon:
     async def _map_build_turn(self, direction):
         """Turn 90 degrees left or right, update direction."""
         import time as _time
+
+        # Unlock canny ROI — car is leaving the intersection onto a new lane
+        if CANNY_AVAILABLE and self._lane_tracker is not None:
+            self._lane_tracker.unlock_roi()
+            logger.info("  🔓 Canny ROI unlocked for map-build turn")
 
         try:
             turn_duration = 2.0  # Doubled for full 90-degree rotation
@@ -804,89 +778,6 @@ class HardwareDaemon:
         if self.sio and self.sio.connected:
             await self.sio.emit('motor-calibrate-data', {
                 'type': 'deadband_done', 'pin': pin
-            })
-
-    # ====== Road Sign Detection Methods ======
-    async def _sign_detect_loop(self):
-        """Continuously detect road signs from camera frames."""
-        if not self._sign_detector or not self._sign_detector.is_ready:
-            logger.warning("Sign detection requested but detector not ready")
-            if self.sio and self.sio.connected:
-                await self.sio.emit('sign-detect-status', {
-                    'detecting': False,
-                    'error': 'Detector not available',
-                })
-            return
-
-        self._sign_detecting = True
-        if self.sio and self.sio.connected:
-            await self.sio.emit('sign-detect-status', {'detecting': True})
-        logger.info("🚦 Sign detection loop started")
-
-        try:
-            while self._sign_detecting:
-                frame_bytes = await self.camera.get_latest_frame()
-                if frame_bytes is None:
-                    await asyncio.sleep(0.5)
-                    continue
-
-                # Run detection in executor to avoid blocking event loop
-                loop = asyncio.get_event_loop()
-                detections = await loop.run_in_executor(
-                    None, self._sign_detector.detect, frame_bytes
-                )
-
-                if detections and self.sio and self.sio.connected:
-                    import time as _time
-                    await self.sio.emit('sign-detected', {
-                        'detections': detections,
-                        'count': len(detections),
-                        'timestamp': _time.time(),
-                    })
-                    logger.info(f"🚦 Detected {len(detections)} sign(s): "
-                                f"{[d['class'] for d in detections]}")
-
-                # ~2 FPS detection rate to keep CPU manageable on Pi 5
-                await asyncio.sleep(0.5)
-
-        except Exception as e:
-            logger.error(f"Sign detection loop error: {e}")
-        finally:
-            self._sign_detecting = False
-            if self.sio and self.sio.connected:
-                await self.sio.emit('sign-detect-status', {'detecting': False})
-            logger.info("🚦 Sign detection loop stopped")
-
-    async def _sign_detect_single(self):
-        """Run a single detection on the current frame and return annotated image."""
-        if not self._sign_detector or not self._sign_detector.is_ready:
-            if self.sio and self.sio.connected:
-                await self.sio.emit('sign-detect-result', {
-                    'detections': [],
-                    'error': 'Detector not available',
-                })
-            return
-
-        frame_bytes = await self.camera.get_latest_frame()
-        if frame_bytes is None:
-            if self.sio and self.sio.connected:
-                await self.sio.emit('sign-detect-result', {
-                    'detections': [],
-                    'error': 'No camera frame',
-                })
-            return
-
-        loop = asyncio.get_event_loop()
-        detections = await loop.run_in_executor(
-            None, self._sign_detector.detect, frame_bytes
-        )
-
-        import time as _time
-        if self.sio and self.sio.connected:
-            await self.sio.emit('sign-detect-result', {
-                'detections': detections,
-                'count': len(detections),
-                'timestamp': _time.time(),
             })
 
     # ====== RFID Methods ======
@@ -1171,20 +1062,27 @@ class HardwareDaemon:
 
         # ── Unified processed stream (mode via query param) ──
         async def handle_processed_stream(request):
-            """MJPEG stream with switchable processing: raw|canny|unet|sign|all."""
+            """MJPEG stream with switchable processing: raw|canny|unet|all."""
             mode = request.query.get('mode', 'raw')
 
             # Only import cv2 when a processing mode actually needs it
             _cv2 = None
-            if mode in ('canny', 'sign', 'all'):
+            if mode in ('canny', 'all'):
                 try:
                     import cv2 as _cv2
                 except ImportError:
                     logger.warning("cv2 not available for mode=%s", mode)
 
+            # Only import cv2 for sign mode too
+            if mode == 'sign' and _cv2 is None:
+                try:
+                    import cv2 as _cv2
+                except ImportError:
+                    logger.warning("cv2 not available for mode=sign")
+
             sleep_map = {
                 'raw': 0.03, 'canny': 0.07, 'unet': 0.10,
-                'sign': 0.15, 'all': 0.20,
+                'all': 0.15, 'sign': 0.05,
             }
             sleep_time = sleep_map.get(mode, 0.1)
 
@@ -1226,15 +1124,56 @@ class HardwareDaemon:
                                     frame_bytes)
                                 jpeg = debug.get('mask_jpeg') or frame_bytes
 
-                        elif mode == 'sign':
-                            if (SIGN_DETECTOR_AVAILABLE
-                                    and self._sign_detector
-                                    and self._sign_detector.is_ready):
-                                _, annotated = \
-                                    self._sign_detector.detect_annotated(
-                                        frame_bytes)
-                                if annotated:
-                                    jpeg = annotated
+                        elif mode == 'sign' and _cv2:
+                            nparr = np.frombuffer(frame_bytes, np.uint8)
+                            bgr = _cv2.imdecode(nparr, _cv2.IMREAD_COLOR)
+                            if bgr is not None:
+                                orig_h, orig_w = bgr.shape[:2]
+                                bgr = _cv2.resize(bgr, (640, 480))
+                                sx = 640.0 / orig_w
+                                sy = 480.0 / orig_h
+                                import time as _time
+                                dets = self._sign_detections
+                                age = _time.time() - self._sign_ts
+                                # Draw bounding boxes if detections are fresh (< 2s)
+                                if dets and age < 2.0:
+                                    # Colors per class
+                                    _colors = {
+                                        'go_straight_sign': (0, 200, 0),
+                                        'park_sign': (200, 200, 0),
+                                        'turn_left_sign': (200, 0, 0),
+                                        'turn_right_sign': (0, 0, 200),
+                                    }
+                                    for d in dets:
+                                        bbox = d.get('bbox', [])
+                                        if len(bbox) != 4:
+                                            continue
+                                        x1 = int(bbox[0] * sx)
+                                        y1 = int(bbox[1] * sy)
+                                        x2 = int(bbox[2] * sx)
+                                        y2 = int(bbox[3] * sy)
+                                        cls = d.get('class', 'unknown')
+                                        conf = d.get('confidence', 0)
+                                        color = _colors.get(cls, (128, 128, 128))
+                                        _cv2.rectangle(bgr, (x1, y1), (x2, y2), color, 2)
+                                        label = f"{cls} {conf*100:.0f}%"
+                                        (tw, th), _ = _cv2.getTextSize(label, _cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                                        _cv2.rectangle(bgr, (x1, y1 - th - 6), (x1 + tw + 4, y1), color, -1)
+                                        _cv2.putText(bgr, label, (x1 + 2, y1 - 4),
+                                                     _cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+                                else:
+                                    # No active detections — show scan status
+                                    _cv2.putText(bgr, "[SIGN] Scanning...",
+                                                 (15, 25), _cv2.FONT_HERSHEY_SIMPLEX,
+                                                 0.6, (0, 255, 255), 2)
+                                # Mode label
+                                h = bgr.shape[0]
+                                _cv2.putText(bgr, "[SIGN] Road Sign Detection",
+                                             (15, h - 15), _cv2.FONT_HERSHEY_SIMPLEX,
+                                             0.5, (255, 255, 0), 1)
+                                _, enc = _cv2.imencode('.jpg', bgr,
+                                                       [_cv2.IMWRITE_JPEG_QUALITY, 90])
+                                jpeg = enc.tobytes()
 
                         elif mode == 'all' and _cv2:
                             nparr = np.frombuffer(frame_bytes, np.uint8)
@@ -1255,35 +1194,7 @@ class HardwareDaemon:
                                 else:
                                     vis = bgr.copy()
 
-                                # 2) Sign detection bboxes on canny vis
-                                if (SIGN_DETECTOR_AVAILABLE
-                                        and self._sign_detector
-                                        and self._sign_detector.is_ready):
-                                    dets = self._sign_detector.detect(
-                                        resized_bytes)
-                                    for d in dets:
-                                        x1, y1, x2, y2 = d['bbox']
-                                        _cv2.rectangle(
-                                            vis, (x1, y1), (x2, y2),
-                                            (0, 255, 0), 2)
-                                        lbl = (f"{d['class']} "
-                                               f"{d['confidence']:.0%}")
-                                        (tw, th), _ = _cv2.getTextSize(
-                                            lbl,
-                                            _cv2.FONT_HERSHEY_SIMPLEX,
-                                            0.6, 1)
-                                        _cv2.rectangle(
-                                            vis,
-                                            (x1, y1 - th - 8),
-                                            (x1 + tw + 6, y1),
-                                            (0, 255, 0), -1)
-                                        _cv2.putText(
-                                            vis, lbl,
-                                            (x1 + 3, y1 - 5),
-                                            _cv2.FONT_HERSHEY_SIMPLEX,
-                                            0.6, (0, 0, 0), 1)
-
-                                # 3) UNet correction overlay text
+                                # 2) UNet correction overlay text
                                 if self.line_follower.is_ready:
                                     dbg = \
                                         self.line_follower.analyse_frame_debug(
@@ -1301,7 +1212,7 @@ class HardwareDaemon:
                                 # 4) Mode label
                                 h = vis.shape[0]
                                 _cv2.putText(
-                                    vis, "[ALL] Canny + Sign + UNet",
+                                    vis, "[ALL] Canny + UNet",
                                     (15, h - 15),
                                     _cv2.FONT_HERSHEY_SIMPLEX,
                                     0.5, (255, 255, 0), 1)

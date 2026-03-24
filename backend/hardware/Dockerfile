@@ -1,5 +1,6 @@
-# Hardware Daemon Dockerfile - Python (standalone container with CPU limits)
-# Runs: motor control, camera stream, RFID, line-following, road sign detection
+# Hardware Daemon Dockerfile - Python (standalone container)
+# Runs: motor control, camera stream, RFID, line-following
+# Road sign detection is handled by separate C++ container (roadsign)
 FROM python:3.11-slim-bookworm
 
 WORKDIR /app
@@ -25,19 +26,12 @@ RUN pip install --no-cache-dir \
     "opencv-python-headless>=4.8.0" \
     "numpy>=1.24.0"
 
-# PyTorch (CPU-only, lightweight) — limit download size
+# PyTorch (CPU-only) — still needed for UNet line follower
 RUN pip install --no-cache-dir --timeout 600 --retries 5 \
     "torch>=2.0.0" --extra-index-url https://download.pytorch.org/whl/cpu
 
-# Ultralytics YOLO for road sign detection
-RUN pip install --no-cache-dir --timeout 600 --retries 5 \
-    "ultralytics>=8.0.0" && \
-    pip install --no-cache-dir --force-reinstall \
-    "opencv-python-headless>=4.8.0"
-
-# Copy model weights
+# Copy model weights (UNet line follower only; road sign uses C++ container)
 COPY line_following/best_unet.pth ./line_following/best_unet.pth
-COPY detect-road-sign/best_trans.pt ./detect-road-sign/best_trans.pt
 
 # Copy canny edge detection module
 COPY canny-edge-detection-main/ ./canny-edge-detection-main/

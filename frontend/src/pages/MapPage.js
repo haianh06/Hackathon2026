@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { getMapPoints, getVehicleStatus, findPath, seedMap } from '../services/api';
+import { getMapPoints, getVehicleStatus, findPath, seedMap, returnToBase } from '../services/api';
 import socket from '../services/socket';
 import DemoMap from '../components/DemoMap';
 import {
@@ -7,7 +7,11 @@ import {
     WrenchScrewdriverIcon,
 } from '@heroicons/react/24/outline';
 
-const LANE_STREAM_URL = '/camera/lane/stream';
+const STREAM_URLS = {
+    unet: '/camera/lane/stream',
+    canny: '/camera/processed/stream?mode=canny',
+    all: '/camera/processed/stream?mode=all',
+};
 const DEBUG_URL = '/camera/lane/debug';
 
 function MapPage() {
@@ -29,6 +33,7 @@ function MapPage() {
     const [debug, setDebug] = useState(null);
     const [debugPolling, setDebugPolling] = useState(false);
     const [debugHistory, setDebugHistory] = useState([]);
+    const [debugStreamMode, setDebugStreamMode] = useState('unet');
     const debugIntervalRef = useRef(null);
 
     // ── Load map data ──
@@ -78,7 +83,7 @@ function MapPage() {
         } catch (err) { console.error(err); }
     };
 
-    const handleResetMap = async () => { try { const r = await seedMap(); setPoints(r.data.data); setActivePath(null); setLivePos(null); } catch (e) { console.error(e); } };
+    const handleResetMap = async () => { try { const [r] = await Promise.all([seedMap(), returnToBase()]); setPoints(r.data.data); setActivePath(null); setLivePos(null); setIsNavigating(false); setVehicle(prev => prev ? { ...prev, currentPosition: 'S', status: 'idle' } : prev); } catch (e) { console.error(e); } };
     const handleFindPath = async () => { if (!pathFrom || !pathTo) return; try { const r = await findPath(pathFrom, pathTo); setActivePath(r.data.data); } catch (e) { console.error(e); } };
     const handleAutoNavigate = () => { if (!activePath || activePath.length < 2) return; setNavLogs([]); setLivePos(null); socket.emit('auto-navigate', { path: activePath.map(p => ({ pointId: p.pointId, x: p.x, y: p.y })) }); };
     const handleStopNavigation = () => { socket.emit('stop-navigation'); setIsNavigating(false); };
@@ -241,10 +246,22 @@ function MapPage() {
                         {/* Lane detection overlay stream */}
                         <div className="bg-white rounded-2xl border border-gray-200 overflow-hidden">
                             <div className="flex items-center justify-between px-4 py-2.5 border-b bg-gray-50">
-                                <span className="text-sm font-semibold text-gray-600">Lane Detection Overlay</span>
+                                <div className="flex items-center gap-2">
+                                    <span className="text-sm font-semibold text-gray-600">
+                                        {debugStreamMode === 'canny' ? 'Canny Edge' : debugStreamMode === 'all' ? 'Canny + UNet' : 'UNet Lane'}
+                                    </span>
+                                    <div className="flex rounded-lg overflow-hidden border border-gray-300">
+                                        {[['unet', 'UNet'], ['canny', 'Canny'], ['all', 'All']].map(([mode, label]) => (
+                                            <button key={mode} onClick={() => setDebugStreamMode(mode)}
+                                                className={`px-2 py-1 text-xs font-medium ${debugStreamMode === mode ? 'bg-blue-600 text-white' : 'bg-white text-gray-600 hover:bg-gray-100'}`}>
+                                                {label}
+                                            </button>
+                                        ))}
+                                    </div>
+                                </div>
                             </div>
                             <div className="aspect-video bg-black flex items-center justify-center">
-                                {debugPolling ? <img src={LANE_STREAM_URL} alt="Lane" className="w-full h-full object-contain" onError={() => {}} />
+                                {debugPolling ? <img src={STREAM_URLS[debugStreamMode]} alt="Lane" className="w-full h-full object-contain" onError={() => { }} />
                                     : <span className="text-gray-500 text-sm">Bấm "Poll" để bắt đầu</span>}
                             </div>
                         </div>

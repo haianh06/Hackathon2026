@@ -6,9 +6,15 @@ function DevPage() {
     const [streaming, setStreaming] = useState(false);
     const [polling, setPolling] = useState(false);
     const [history, setHistory] = useState([]);
+    const [streamMode, setStreamMode] = useState('unet'); // 'unet' | 'canny' | 'all'
     const intervalRef = useRef(null);
 
-    const STREAM_URL = '/camera/lane/stream';
+    const STREAM_URLS = {
+        unet: '/camera/lane/stream',
+        canny: '/camera/processed/stream?mode=canny',
+        all: '/camera/processed/stream?mode=all',
+    };
+    const STREAM_URL = STREAM_URLS[streamMode];
     const DEBUG_URL = '/camera/lane/debug';
 
     useEffect(() => {
@@ -82,7 +88,19 @@ function DevPage() {
                     {/* Lane overlay */}
                     <div className="bg-white rounded-2xl border border-gray-200 overflow-hidden">
                         <div className="flex items-center justify-between px-5 py-3 border-b bg-gray-50">
-                            <span className="text-sm font-semibold text-gray-600">Lane Detection Overlay</span>
+                            <div className="flex items-center gap-2">
+                                <span className="text-sm font-semibold text-gray-600">
+                                    {streamMode === 'canny' ? 'Canny Edge' : streamMode === 'all' ? 'Canny + UNet' : 'UNet Lane'}
+                                </span>
+                                <div className="flex rounded-lg overflow-hidden border border-gray-300">
+                                    {[['unet', 'UNet'], ['canny', 'Canny'], ['all', 'All']].map(([mode, label]) => (
+                                        <button key={mode} onClick={() => { setStreamMode(mode); if (streaming) { setStreaming(false); setTimeout(() => setStreaming(true), 100); } }}
+                                            className={`px-2 py-1 text-xs font-medium ${streamMode === mode ? 'bg-blue-600 text-white' : 'bg-white text-gray-600 hover:bg-gray-100'}`}>
+                                            {label}
+                                        </button>
+                                    ))}
+                                </div>
+                            </div>
                             <button onClick={() => setStreaming(s => !s)}
                                 className={`px-3 py-1.5 text-xs font-medium rounded-lg ${streaming ? 'bg-red-500 text-white' : 'bg-amber-500 text-white'}`}>
                                 {streaming ? 'Stop' : 'Start'}

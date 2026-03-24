@@ -58,6 +58,7 @@ export const seedMap = () => api.post('/map/seed');
 
 // Vehicle
 export const getVehicleStatus = () => api.get('/vehicle/status');
+export const returnToBase = () => api.post('/vehicle/return');
 
 // Hardware
 export const getHardwareStatus = () => api.get('/hardware/status');

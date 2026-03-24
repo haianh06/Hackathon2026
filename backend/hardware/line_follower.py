@@ -244,6 +244,12 @@ class LineFollower:
         """Reset EMA state — call when starting a new navigation segment."""
         self._ema_correction = 0.0
         self._ema_lane_width = None
+        # Reset canny PID integral term
+        if self._canny_available and self._canny_detector is not None:
+            self._canny_detector._integral = 0.0
+            self._canny_detector.steer_ema.value = None
+            # Unlock ROI for new segment
+            self._canny_detector.unlock_roi()
 
     # ────────────────────────────────────────────────────────
     @property

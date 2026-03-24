@@ -53,6 +53,7 @@ services:
       NODE_ENV: production
       ENABLE_HARDWARE: "true"
       HARDWARE_DOCKER: "true"
+      ROADSIGN_URL: http://roadsign:9001
     depends_on:
       mongodb:
         condition: service_healthy
@@ -61,7 +62,7 @@ services:
     networks:
       - app-network
 
-  # ===== Hardware Daemon (Python - motor, camera, YOLO) =====
+  # ===== Hardware Daemon (Python - motor, camera, line-following) =====
   hardware:
     build:
       context: ./backend
@@ -87,8 +88,42 @@ services:
       OMP_NUM_THREADS: "2"
       MKL_NUM_THREADS: "2"
       OPENBLAS_NUM_THREADS: "2"
-      TORCH_NUM_THREADS: "2"
       PYTHONUNBUFFERED: "1"
+    depends_on:
+      - backend
+    networks:
+      - app-network
+
+  # ===== Road Sign Detector (C++ ONNX Runtime — high-perf CPU inference) =====
+  roadsign:
+    build:
+      context: ./backend/detect-road-sign
+      dockerfile: Dockerfile
+    container_name: hackathon-roadsign
+    restart: unless-stopped
+    ports:
+      - "9001:9001"
+    environment:
+      MODEL_PATH: /app/detect-road-sign/best_yolo.onnx
+      CONF_THRESHOLD: "0.5"
+      NMS_IOU_THRESHOLD: "0.45"
+      NUM_THREADS: "2"
+      INPUT_SIZE: "640"
+      DETECT_PORT: "9001"
+      DETECT_INTERVAL_MS: "300"
+      # Camera mode: "mjpeg" (HTTP stream from hardware daemon)
+      CAMERA_MODE: "mjpeg"
+      V4L2_DEVICE: "/dev/video0"
+      V4L2_WIDTH: "640"
+      V4L2_HEIGHT: "480"
+      # MJPEG fallback URL (used if CAMERA_MODE=mjpeg)
+      CAMERA_MJPEG_URL: http://hardware:8765/stream
+      BACKEND_HOST: backend
+      BACKEND_PORT: "5000"
+      # Pin ONNX inference to cores 2-3 (cores 0=system, 1=camera I/O)
+      OMP_NUM_THREADS: "2"
+      GOMP_CPU_AFFINITY: "2-3"
+      USE_FP16: "false"
     depends_on:
       - backend
     networks:

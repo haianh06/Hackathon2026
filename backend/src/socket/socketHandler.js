@@ -237,33 +237,50 @@ function setupSocket(io) {
             io.to('hardware').emit('motor-calibrate-deadband', data);
         });
 
-        // ====== Road Sign Detection Events ======
-        // Frontend → Hardware: start continuous sign detection
-        socket.on('sign-detect-start', () => {
-            io.to('hardware').emit('sign-detect-start');
+        // ====== Road Sign Detection Events (C++ container) ======
+        // Frontend → C++ container: start continuous sign detection
+        socket.on('sign-detect-start', async () => {
+            try {
+                const roadsignUrl = process.env.ROADSIGN_URL || 'http://roadsign:9001';
+                await fetch(`${roadsignUrl}/start`, { method: 'POST', signal: AbortSignal.timeout(5000) });
+                io.emit('sign-detect-status', { detecting: true });
+            } catch (err) {
+                console.error('sign-detect-start error:', err.message);
+                io.emit('sign-detect-status', { detecting: false, error: err.message });
+            }
         });
 
-        // Frontend → Hardware: stop sign detection
-        socket.on('sign-detect-stop', () => {
-            io.to('hardware').emit('sign-detect-stop');
+        // Frontend → C++ container: stop sign detection
+        socket.on('sign-detect-stop', async () => {
+            try {
+                const roadsignUrl = process.env.ROADSIGN_URL || 'http://roadsign:9001';
+                await fetch(`${roadsignUrl}/stop`, { method: 'POST', signal: AbortSignal.timeout(5000) });
+                io.emit('sign-detect-status', { detecting: false });
+            } catch (err) {
+                console.error('sign-detect-stop error:', err.message);
+            }
         });
 
-        // Frontend → Hardware: single-frame detection
-        socket.on('sign-detect-once', () => {
-            io.to('hardware').emit('sign-detect-once');
+        // Frontend → C++ container: single-frame detection
+        socket.on('sign-detect-once', async () => {
+            try {
+                const roadsignUrl = process.env.ROADSIGN_URL || 'http://roadsign:9001';
+                await fetch(`${roadsignUrl}/detect_once`, { method: 'POST', signal: AbortSignal.timeout(10000) });
+            } catch (err) {
+                console.error('sign-detect-once error:', err.message);
+                io.emit('sign-detect-result', { detections: [], error: err.message });
+            }
         });
 
-        // Hardware → Frontend: continuous detection results
+        // C++ container → Frontend: these are now received via HTTP POST
+        // and broadcasted by hardwareController.js, but keep socket
+        // forwarding for backward compatibility
         socket.on('sign-detected', (data) => {
             io.emit('sign-detected', data);
         });
-
-        // Hardware → Frontend: detection status (running/stopped)
         socket.on('sign-detect-status', (data) => {
             io.emit('sign-detect-status', data);
         });
-
-        // Hardware → Frontend: single detection result
         socket.on('sign-detect-result', (data) => {
             io.emit('sign-detect-result', data);
         });
