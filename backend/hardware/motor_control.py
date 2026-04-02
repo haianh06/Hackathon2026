@@ -1,23 +1,27 @@
 #!/usr/bin/env python3
 """
 Motor Control Module for Raspberry Pi 5 Delivery Bot
-Dual Servo Motor via lgpio PWM on GPIO 12 & 13
+Dual Servo Motor via Hardware PWM on GPIO 12 & 13
 
-Vehicle has 2 continuous-rotation servo motors controlled by PWM:
-  - Forward:  Left servo CCW, Right servo CW
-  - Backward: Left servo CW,  Right servo CCW
-  - Turn Left:  Left servo CCW, Right servo CCW (pivot)
-  - Turn Right: Left servo CW,  Right servo CW  (pivot)
-  - Stop:     PWM duty = 0 on both pins
+Uses rpi-hardware-pwm (sysfs /sys/class/pwm) for jitter-free PWM.
+Requires dtoverlay=pwm-2chan,pin=12,func=4,pin2=13,func2=4 in
+/boot/firmware/config.txt.
 
-PWM Parameters:
-  Frequency: 50 Hz (standard servo)
-  Neutral:   1500 µs pulse width
-  Drive:     ±300 µs from neutral
-  Turn:      ±200 µs from neutral
+Vehicle has 2 continuous-rotation servo motors controlled by PWM.
+Each motor has its own neutral point and drive offset (asymmetric).
+
+  - Forward:  Both motors pulse > their neutral
+  - Backward: Both motors pulse < their neutral
+  - Turn Left:  Left backward, Right forward (pivot)
+  - Turn Right: Left forward, Right backward (pivot)
+  - Stop:     PWM disabled on both channels
+
+All PWM parameters are loaded from environment variables for easy
+tuning without rebuilding Docker. See hardware.env for defaults.
 """
 
 import logging
+import os
 import time
 import math
 import asyncio
@@ -25,28 +29,54 @@ import threading
 
 logger = logging.getLogger('motor_control')
 
-# Try to import lgpio
+# Try to import rpi-hardware-pwm
 try:
-    import lgpio
-    from gpio_handle import gpio_open
-    GPIO_AVAILABLE = True
-    logger.info("lgpio imported successfully")
+    from rpi_hardware_pwm import HardwarePWM
+    HW_PWM_AVAILABLE = True
+    logger.info("rpi-hardware-pwm imported successfully")
 except ImportError:
-    GPIO_AVAILABLE = False
-    logger.warning("lgpio not available - motor will use mock mode")
+    HW_PWM_AVAILABLE = False
+    logger.warning("rpi-hardware-pwm not available - motor will use mock mode")
 
 
-# ─── PWM Servo Constants ───
-LEFT_PIN = 12       # BCM GPIO 12 - Left servo
-RIGHT_PIN = 13      # BCM GPIO 13 - Right servo
-PWM_FREQ = 50       # 50 Hz = standard servo frequency
-STOP_VAL = 1500     # µs - neutral / stop position
-DRIVE_SPEED = 300   # µs - offset from neutral for straight drive
-TURN_SPEED = 200    # µs - offset from neutral for turning
+
+# ─── PWM Servo Constants (from environment variables) ───
+# dtoverlay=pwm-2chan,pin=12,func=4,pin2=13,func2=4
+# GPIO 12 → PWM chip 2, channel 0
+# GPIO 13 → PWM chip 2, channel 2
+LEFT_PWM_CHIP  = int(os.environ.get('MOTOR_LEFT_PWM_CHIP', 2))
+LEFT_PWM_CHAN  = int(os.environ.get('MOTOR_LEFT_PWM_CHANNEL', 0))
+RIGHT_PWM_CHIP = int(os.environ.get('MOTOR_RIGHT_PWM_CHIP', 2))
+RIGHT_PWM_CHAN = int(os.environ.get('MOTOR_RIGHT_PWM_CHANNEL', 2))
+PWM_FREQ       = int(os.environ.get('MOTOR_PWM_FREQ', 50))
+
+# Legacy pin numbers (kept for status reporting / calibration UI)
+LEFT_PIN       = int(os.environ.get('MOTOR_LEFT_PIN', 12))
+RIGHT_PIN      = int(os.environ.get('MOTOR_RIGHT_PIN', 13))
+
+# Each motor has its own neutral (dead band center) point
+LEFT_NEUTRAL   = int(os.environ.get('MOTOR_LEFT_NEUTRAL', 1500))
+RIGHT_NEUTRAL  = int(os.environ.get('MOTOR_RIGHT_NEUTRAL', 1500))
+
+# Stop point calibration: exact µs where servo truly stops
+LEFT_STOP_POINT  = int(os.environ.get('MOTOR_LEFT_STOP_POINT', 1500))
+RIGHT_STOP_POINT = int(os.environ.get('MOTOR_RIGHT_STOP_POINT', 1500))
+
+# Drive/turn offsets per motor (above neutral = forward)
+LEFT_DRIVE_OFFSET  = int(os.environ.get('MOTOR_LEFT_DRIVE_OFFSET', 200))
+RIGHT_DRIVE_OFFSET = int(os.environ.get('MOTOR_RIGHT_DRIVE_OFFSET', 200))
+LEFT_TURN_OFFSET   = int(os.environ.get('MOTOR_LEFT_TURN_OFFSET', 200))
+RIGHT_TURN_OFFSET  = int(os.environ.get('MOTOR_RIGHT_TURN_OFFSET', 200))
+
+# Left motor mirror-mounted? (calibration UI inversion)
+LEFT_MIRROR = os.environ.get('MOTOR_LEFT_MIRROR', '0') == '1'
+
+# Drift bias
+DRIFT_BIAS = float(os.environ.get('MOTOR_DRIFT_BIAS', '0.0'))
 
 # ─── PWM Ramp Constants ───
-RAMP_STEP_US = 10    # µs per ramp step
-RAMP_STEP_MS = 10    # ms delay between ramp steps
+RAMP_STEP_US = int(os.environ.get('MOTOR_RAMP_STEP_US', 10))
+RAMP_STEP_MS = int(os.environ.get('MOTOR_RAMP_STEP_MS', 10))
 
 
 class MockMotorController:
@@ -86,68 +116,114 @@ class MockMotorController:
         return {'driver': 'mock', 'status': self.status, 'type': 'dual_servo'}
 
 
-class LgpioPWMController:
+class HardwarePWMController:
     """
-    Dual Servo Motor controller via lgpio PWM.
-    Directly drives 2 continuous-rotation servos on GPIO 12 & 13.
+    Dual Servo Motor controller via Pi5 Hardware PWM (sysfs).
+    Uses rpi-hardware-pwm for rock-solid, jitter-free PWM output.
+    
+    dtoverlay=pwm-2chan,pin=12,func=4,pin2=13,func2=4
+      GPIO 12 → pwmchip2/pwm0  (left motor)
+      GPIO 13 → pwmchip2/pwm2  (right motor)
     """
     def __init__(self, config):
         motor_cfg = config.get('motor', {})
         self.left_pin = motor_cfg.get('left_pin', LEFT_PIN)
         self.right_pin = motor_cfg.get('right_pin', RIGHT_PIN)
-        self.drive_speed = motor_cfg.get('drive_speed', DRIVE_SPEED)
-        self.turn_speed = motor_cfg.get('turn_speed', TURN_SPEED)
+
+        # Per-motor neutral and offsets (from env vars)
+        self.left_neutral = LEFT_NEUTRAL
+        self.right_neutral = RIGHT_NEUTRAL
+        self.left_stop_point = LEFT_STOP_POINT
+        self.right_stop_point = RIGHT_STOP_POINT
+        self.left_drive_offset = LEFT_DRIVE_OFFSET
+        self.right_drive_offset = RIGHT_DRIVE_OFFSET
+        self.left_turn_offset = LEFT_TURN_OFFSET
+        self.right_turn_offset = RIGHT_TURN_OFFSET
+        self.drift_bias = DRIFT_BIAS
+
         self.status = 'idle'
-        self._claimed = False
-        self._h = None
+        self._pwm_active = False
 
         # PWM ramp state
-        self._current_left_us = STOP_VAL
-        self._current_right_us = STOP_VAL
+        self._current_left_us = self.left_neutral
+        self._current_right_us = self.right_neutral
         self._ramp_cancel = threading.Event()
         self._ramp_thread = None
 
-        self._init_gpio()
+        # Hardware PWM instances
+        self._left_pwm = None
+        self._right_pwm = None
+        self._hw_ready = False
 
-    def _init_gpio(self):
-        """Initialize GPIO handle and claim output pins"""
+        self._init_hw_pwm()
+
+    def _init_hw_pwm(self):
+        """Initialize Hardware PWM channels via sysfs."""
         try:
-            self._h = gpio_open()
-            if self._h is None:
-                raise RuntimeError("gpio_open() returned None")
-
-            if not self._claimed:
-                try:
-                    lgpio.gpio_claim_output(self._h, self.left_pin)
-                    lgpio.gpio_claim_output(self._h, self.right_pin)
-                    self._claimed = True
-                    logger.info(f"GPIO pins claimed: L={self.left_pin}, R={self.right_pin}")
-                except lgpio.error as e:
-                    if "busy" in str(e).lower():
-                        logger.warning("GPIO pins already claimed, reusing")
-                        self._claimed = True
-                    else:
-                        raise
-
-            logger.info(f"✅ LgpioPWM motor ready: L=GPIO{self.left_pin}, R=GPIO{self.right_pin}")
+            self._left_pwm = HardwarePWM(
+                pwm_channel=LEFT_PWM_CHAN,
+                hz=PWM_FREQ,
+                chip=LEFT_PWM_CHIP,
+            )
+            self._right_pwm = HardwarePWM(
+                pwm_channel=RIGHT_PWM_CHAN,
+                hz=PWM_FREQ,
+                chip=RIGHT_PWM_CHIP,
+            )
+            self._hw_ready = True
+            logger.info(
+                f"✅ HardwarePWM ready: "
+                f"L=chip{LEFT_PWM_CHIP}/ch{LEFT_PWM_CHAN}(GPIO{self.left_pin}), "
+                f"R=chip{RIGHT_PWM_CHIP}/ch{RIGHT_PWM_CHAN}(GPIO{self.right_pin})"
+            )
         except Exception as e:
-            logger.error(f"❌ GPIO init failed: {e}")
-            self._h = None
+            logger.error(f"❌ Hardware PWM init failed: {e}")
+            self._hw_ready = False
 
-    def _set_pwm(self, pin, pulse_us):
-        """Set PWM on a pin with given pulse width in microseconds"""
-        if self._h is None:
-            logger.warning("GPIO not initialized, cannot set PWM")
+    def _set_pwm(self, channel, pulse_us):
+        """Set PWM pulse width in microseconds on a channel.
+        channel: 'left' or 'right' (or the HardwarePWM instance).
+        pulse_us=0 → disable PWM on that channel."""
+        pwm_obj = self._left_pwm if channel == 'left' else self._right_pwm
+        if pwm_obj is None:
             return
         try:
             if pulse_us == 0:
-                # Stop PWM
-                lgpio.tx_pwm(self._h, pin, 0, 0)
+                pwm_obj.stop()
             else:
-                duty = (pulse_us / 20000.0) * 100.0  # Convert µs to duty cycle %
-                lgpio.tx_pwm(self._h, pin, PWM_FREQ, duty)
+                duty = (pulse_us / 20000.0) * 100.0  # µs → duty cycle %
+                if not self._pwm_active:
+                    pwm_obj.start(duty)
+                else:
+                    pwm_obj.change_duty_cycle(duty)
         except Exception as e:
-            logger.error(f"PWM error on pin {pin}: {e}")
+            logger.error(f"HW PWM error ({channel}): {e}")
+
+    def _set_both_pwm(self, left_us, right_us):
+        """Set PWM on both channels simultaneously."""
+        if not self._hw_ready:
+            return
+        left_duty = (left_us / 20000.0) * 100.0
+        right_duty = (right_us / 20000.0) * 100.0
+        try:
+            if not self._pwm_active:
+                self._left_pwm.start(left_duty)
+                self._right_pwm.start(right_duty)
+                self._pwm_active = True
+            else:
+                self._left_pwm.change_duty_cycle(left_duty)
+                self._right_pwm.change_duty_cycle(right_duty)
+        except Exception as e:
+            logger.error(f"HW PWM set_both error: {e}")
+
+    def _ensure_pwm_at_neutral(self):
+        """Start PWM at neutral if currently stopped."""
+        if not self._pwm_active:
+            self._set_both_pwm(self.left_neutral, self.right_neutral)
+            self._current_left_us = self.left_neutral
+            self._current_right_us = self.right_neutral
+            time.sleep(0.05)
+            logger.debug("HW PWM re-enabled at neutral before ramp")
 
     # ─── PWM Ramping ───
     def _cancel_ramp(self):
@@ -157,8 +233,7 @@ class LgpioPWMController:
             self._ramp_thread.join(timeout=1.0)
 
     def _do_ramp(self, left_target, right_target, cancel_event=None):
-        """Ramp both motors from current to target. 10µs/step, 10ms/step.
-        Can run in thread (non-blocking) or directly (blocking)."""
+        """Ramp both motors from current to target. 10µs/step, 10ms/step."""
         left_cur = self._current_left_us
         right_cur = self._current_right_us
         left_diff = left_target - left_cur
@@ -166,8 +241,7 @@ class LgpioPWMController:
 
         # Tiny change → apply directly
         if abs(left_diff) <= RAMP_STEP_US and abs(right_diff) <= RAMP_STEP_US:
-            self._set_pwm(self.left_pin, left_target)
-            self._set_pwm(self.right_pin, right_target)
+            self._set_both_pwm(left_target, right_target)
             self._current_left_us = left_target
             self._current_right_us = right_target
             return
@@ -184,21 +258,20 @@ class LgpioPWMController:
             frac = i / max_steps
             l = int(round(left_cur + left_diff * frac))
             r = int(round(right_cur + right_diff * frac))
-            self._set_pwm(self.left_pin, l)
-            self._set_pwm(self.right_pin, r)
+            self._set_both_pwm(l, r)
             self._current_left_us = l
             self._current_right_us = r
             time.sleep(RAMP_STEP_MS / 1000.0)
 
         # Ensure exact final values
-        self._set_pwm(self.left_pin, left_target)
-        self._set_pwm(self.right_pin, right_target)
+        self._set_both_pwm(left_target, right_target)
         self._current_left_us = left_target
         self._current_right_us = right_target
 
     def _ramp_to(self, left_target, right_target):
-        """Start non-blocking ramp in background thread"""
+        """Start non-blocking ramp in background thread."""
         self._cancel_ramp()
+        self._ensure_pwm_at_neutral()
         cancel = threading.Event()
         self._ramp_cancel = cancel
         t = threading.Thread(
@@ -210,94 +283,121 @@ class LgpioPWMController:
         self._ramp_thread = t
 
     def forward(self, speed=50):
-        """Both servos rotate forward with smooth PWM ramp"""
+        """Both wheels forward with drift compensation."""
         self.status = 'forward'
-        self._ramp_to(STOP_VAL - self.drive_speed, STOP_VAL + self.drive_speed)
-        logger.info("Forward: ramping to drive speed")
+        left_bias_us = int(self.drift_bias * self.left_drive_offset * 0.3)
+        right_bias_us = int(self.drift_bias * self.right_drive_offset * 0.3)
+        self._ramp_to(
+            self.left_neutral - self.left_drive_offset - left_bias_us,
+            self.right_neutral + self.right_drive_offset - right_bias_us,
+        )
+        logger.info("Forward: ramping to drive speed (drift-compensated)")
 
     def backward(self, speed=50):
-        """Both servos rotate backward with smooth PWM ramp"""
+        """Both wheels backward."""
         self.status = 'backward'
-        self._ramp_to(STOP_VAL + self.drive_speed, STOP_VAL - self.drive_speed)
+        self._ramp_to(
+            self.left_neutral + self.left_drive_offset,
+            self.right_neutral - self.right_drive_offset,
+        )
         logger.info("Backward: ramping to drive speed")
 
     def turn_left(self, speed=50):
-        """Pivot left with smooth PWM ramp"""
+        """Pivot left."""
         self.status = 'turning_left'
-        self._ramp_to(STOP_VAL - self.turn_speed, STOP_VAL - self.turn_speed)
+        self._ramp_to(
+            self.left_neutral - self.left_turn_offset,
+            self.right_neutral - self.right_turn_offset,
+        )
         logger.info("Turn Left: ramping (pivot)")
 
     def turn_right(self, speed=50):
-        """Pivot right with smooth PWM ramp"""
+        """Pivot right."""
         self.status = 'turning_right'
-        self._ramp_to(STOP_VAL + self.turn_speed, STOP_VAL + self.turn_speed)
+        self._ramp_to(
+            self.left_neutral + self.left_turn_offset,
+            self.right_neutral + self.right_turn_offset,
+        )
         logger.info("Turn Right: ramping (pivot)")
 
     def forward_steer(self, correction, speed_factor=1.0):
         """
         Drive forward with differential steering.
-
         correction in [-1.0 … +1.0]:
-          negative → steer LEFT  (slow left wheel, speed right)
-          positive → steer RIGHT (speed left wheel, slow right)
-          0        → straight
-
-        Uses asymmetric differential: the inner wheel slows down
-        proportionally while the outer wheel maintains or increases speed.
-        For large corrections (>0.6), the inner wheel can stop or
-        briefly reverse for tighter turns while still moving forward.
+          negative → steer LEFT, positive → steer RIGHT
         """
-        MAX_STEER = self.drive_speed * 0.65  # 195 µs max steer range
+        corrected = correction + self.drift_bias
+        corrected = max(-1.0, min(1.0, corrected))
 
-        # Non-linear: small corrections are gentle, large are aggressive
-        # This gives precision near center and power at extremes
-        abs_c = min(abs(correction), 1.0)
-        shaped = abs_c ** 0.7  # exponent < 1 → more responsive at small values
-        sign = -1 if correction < 0 else 1
-        offset = sign * shaped * MAX_STEER
+        left_max_steer = self.left_drive_offset * 0.65
+        right_max_steer = self.right_drive_offset * 0.65
 
-        base_drive = self.drive_speed * speed_factor
+        abs_c = min(abs(corrected), 1.0)
+        shaped = abs_c ** 0.7
+        sign = 1 if corrected >= 0 else -1
 
-        left_pwm  = STOP_VAL - base_drive + offset
-        right_pwm = STOP_VAL + base_drive + offset
+        base_left = self.left_neutral - self.left_drive_offset * speed_factor
+        base_right = self.right_neutral + self.right_drive_offset * speed_factor
 
-        # Clamp: avoid crossing neutral (would reverse a wheel unintentionally)
-        # But allow near-neutral for tight turns
-        left_pwm  = min(left_pwm, STOP_VAL - 30)
-        right_pwm = max(right_pwm, STOP_VAL + 30)
+        left_pwm  = base_left - sign * shaped * left_max_steer
+        right_pwm = base_right - sign * shaped * right_max_steer
+
+        left_pwm  = min(left_pwm, self.left_neutral - 30)
+        right_pwm = max(right_pwm, self.right_neutral + 30)
 
         self.status = 'forward_steer'
-        self._set_pwm(self.left_pin, left_pwm)
-        self._set_pwm(self.right_pin, right_pwm)
+        self._set_both_pwm(int(left_pwm), int(right_pwm))
         self._current_left_us = int(left_pwm)
         self._current_right_us = int(right_pwm)
 
     def stop(self):
-        """Stop both servos with smooth ramp-down to neutral"""
+        """Ramp to stop point, then disable PWM."""
         self.status = 'idle'
         self._cancel_ramp()
-        # Ramp to neutral synchronously (blocking ensures motors actually stop)
-        self._do_ramp(STOP_VAL, STOP_VAL)
-        # Cut PWM signal
-        self._set_pwm(self.left_pin, 0)
-        self._set_pwm(self.right_pin, 0)
-        self._current_left_us = STOP_VAL
-        self._current_right_us = STOP_VAL
-        logger.info("Stop: ramped to neutral")
+
+        if self._pwm_active:
+            self._do_ramp(self.left_stop_point, self.right_stop_point)
+            time.sleep(0.05)
+
+        # Stop PWM output entirely
+        try:
+            if self._left_pwm:
+                self._left_pwm.stop()
+            if self._right_pwm:
+                self._right_pwm.stop()
+        except Exception as e:
+            logger.warning(f"PWM stop error: {e}")
+        self._pwm_active = False
+
+        self._current_left_us = self.left_neutral
+        self._current_right_us = self.right_neutral
+        logger.info("Stop: ramped to stop point → HW PWM disabled")
 
     def cleanup(self):
-        """Stop motors and release GPIO"""
+        """Stop motors and release PWM resources."""
         self.stop()
-        logger.info("Motor GPIO cleanup done")
+        try:
+            if self._left_pwm:
+                self._left_pwm.stop()
+            if self._right_pwm:
+                self._right_pwm.stop()
+        except Exception:
+            pass
+        self._left_pwm = None
+        self._right_pwm = None
+        self._hw_ready = False
+        logger.info("Motor HW PWM cleanup done")
 
     def get_status(self):
         return {
-            'driver': 'lgpio_pwm',
+            'driver': 'hardware_pwm',
             'type': 'dual_servo',
             'status': self.status,
             'left_pin': self.left_pin,
             'right_pin': self.right_pin,
-            'gpio_connected': self._h is not None
+            'left_chip_channel': f"chip{LEFT_PWM_CHIP}/ch{LEFT_PWM_CHAN}",
+            'right_chip_channel': f"chip{RIGHT_PWM_CHIP}/ch{RIGHT_PWM_CHAN}",
+            'hw_ready': self._hw_ready,
         }
 
 
@@ -306,18 +406,18 @@ def create_motor_controller(config):
     motor_cfg = config.get('motor', {})
     driver_type = motor_cfg.get('driver_type', 'auto')
 
-    logger.info(f"Motor config: driver={driver_type}, GPIO available={GPIO_AVAILABLE}")
+    logger.info(f"Motor config: driver={driver_type}, HW_PWM={HW_PWM_AVAILABLE}")
 
-    # Try lgpio PWM first (direct hardware control)
-    if GPIO_AVAILABLE and driver_type in ('lgpio', 'pwm', 'auto'):
+    # Try Hardware PWM first (Pi5 sysfs — jitter-free)
+    if HW_PWM_AVAILABLE and driver_type in ('hardware_pwm', 'pwm', 'auto'):
         try:
-            ctrl = LgpioPWMController(config)
-            if ctrl._h is not None:
+            ctrl = HardwarePWMController(config)
+            if ctrl._hw_ready:
                 return ctrl
             else:
-                logger.warning("LgpioPWM created but GPIO handle is None")
+                logger.warning("HardwarePWM created but not ready")
         except Exception as e:
-            logger.warning(f"LgpioPWM init failed: {e}")
+            logger.warning(f"HardwarePWM init failed: {e}")
 
     # Fallback to mock
     logger.info("Using MockMotorController (no hardware)")

@@ -244,10 +244,11 @@ class LineFollower:
         """Reset EMA state — call when starting a new navigation segment."""
         self._ema_correction = 0.0
         self._ema_lane_width = None
-        # Reset canny PID integral term
+        # Reset canny PID integral term + target X PID
         if self._canny_available and self._canny_detector is not None:
             self._canny_detector._integral = 0.0
             self._canny_detector.steer_ema.value = None
+            self._canny_detector.reset_target_x()
             # Unlock ROI for new segment
             self._canny_detector.unlock_roi()
 
@@ -260,14 +261,14 @@ class LineFollower:
         """
         Analyse a JPEG frame and return EMA-smoothed steering correction [-1 … +1].
 
-        Decision hierarchy:
-          1. CANNY (primary) — AdaptiveTrackerV2 computes the Point of
-             Orientation from sliding-window edge detection + PD controller.
-             The vehicle steers toward this point.
-          2. UNET (secondary) — only used as a safety check: if the UNet
-             mask shows a white border dangerously close to the lane centre
-             it triggers an emergency avoidance override.
-          3. If Canny is unavailable, UNet steers as a fallback.
+        Decision hierarchy (3-tier):
+          1. TARGET X (primary) — So sánh vị trí vạch trắng bên trái/phải
+             với target_left_x / target_right_x cố định. Nếu tâm xe nằm
+             giữa 2 target → giữa làn. Nếu lệch → PID kéo xe về giữa.
+          2. CANNY (secondary) — AdaptiveTrackerV2 full pipeline với PD
+             controller + Pure Pursuit. Dùng khi target X không đủ tin cậy.
+          3. UNET (tertiary) — UNet lane mask + emergency override khi xe
+             sắp lệch ra ngoài làn.
 
         Returns 0.0 on any error.
         """
@@ -280,17 +281,30 @@ class LineFollower:
             if frame is None:
                 return 0.0
 
-            # ── CANNY = PRIMARY: Point of Orientation steering ──
-            canny_steer = None
+            frame_resized = self._cv2.resize(frame, (640, 480))
+
+            # ── TIER 1: TARGET X = PRIMARY (lane centering) ──
+            tx_steer = None
+            tx_conf = 0.0
             if self._canny_available and self._canny_detector is not None:
                 try:
-                    frame_resized = self._cv2.resize(frame, (640, 480))
-                    steer_val, _ = self._canny_detector.process_frame(frame_resized)
-                    canny_steer = float(steer_val)
+                    tx_steer, tx_conf, tx_left, tx_right = \
+                        self._canny_detector.get_target_x_steering(frame_resized)
                 except Exception as e:
-                    logger.debug(f"Canny detection error: {e}")
+                    logger.debug(f"Target X steering error: {e}")
 
-            # ── UNET = SECONDARY: lane passability check only ──
+            # ── TIER 2: CANNY = SECONDARY (full pipeline) ──
+            canny_steer = None
+            if tx_steer is None or tx_conf < 0.5:
+                # Only run full canny when target X is insufficient
+                if self._canny_available and self._canny_detector is not None:
+                    try:
+                        steer_val, _ = self._canny_detector.process_frame(frame_resized)
+                        canny_steer = float(steer_val)
+                    except Exception as e:
+                        logger.debug(f"Canny detection error: {e}")
+
+            # ── TIER 3: UNET = TERTIARY (safety check + fallback) ──
             unet_raw = 0.0
             if self.model is not None:
                 mask = self._get_mask(frame)
@@ -299,50 +313,61 @@ class LineFollower:
                 roi = mask[roi_top:, :]
                 unet_raw = self._lane_gap_offset(roi)
 
-            # ── Decide final steering: canny (primary) + unet (centering) ──
-            abs_unet = abs(unet_raw)
+            # ── Decision: tiered fallback ──
+            raw = 0.0
+            primary_source = 'none'
 
-            if canny_steer is not None:
-                # Canny = primary steer (already has PD + EMA internally)
+            if tx_steer is not None and tx_conf >= 1.0:
+                # Cả 2 vạch → tin cậy cao nhất → dùng target X trực tiếp
+                raw = tx_steer
+                primary_source = 'target_x'
+            elif tx_steer is not None and tx_conf >= 0.5:
+                # 1 vạch → target X primary, blend với canny nếu có
+                if canny_steer is not None:
+                    raw = 0.7 * tx_steer + 0.3 * canny_steer
+                else:
+                    raw = tx_steer
+                primary_source = 'target_x+canny'
+            elif canny_steer is not None:
+                # Không thấy vạch nào → dùng canny
                 raw = canny_steer
+                primary_source = 'canny'
+            else:
+                # Canny cũng không có → dùng UNet
+                raw = unet_raw
+                primary_source = 'unet'
 
-                # UNet gradual centerline correction:
-                # unet_raw > 0 → lane center is RIGHT → car drifting LEFT → steer RIGHT
-                # unet_raw < 0 → lane center is LEFT  → car drifting RIGHT → steer LEFT
-                # As offset grows, blend UNet correction progressively.
-                if abs_unet > UNET_EMERGENCY_THRESHOLD:
-                    # EMERGENCY: car about to cross white line → hard steer toward center
-                    raw = float(np.clip(unet_raw * UNET_EMERGENCY_GAIN, -1.0, 1.0))
-                    logger.warning(
-                        f"UNET EMERGENCY: off-center {abs_unet:.0%}! "
-                        f"canny={canny_steer:+.3f} unet={unet_raw:+.3f} → override={raw:+.3f}"
-                    )
-                elif abs_unet > UNET_WARN_THRESHOLD:
-                    # WARNING ZONE: gradually blend UNet correction into canny steer
-                    # blend ramps from 0 at warn threshold to UNET_BLEND_GAIN at emergency
-                    blend = ((abs_unet - UNET_WARN_THRESHOLD) /
-                             (UNET_EMERGENCY_THRESHOLD - UNET_WARN_THRESHOLD))
-                    blend = min(blend, 1.0) * UNET_BLEND_GAIN
-                    # Weighted mix: (1-blend)*canny + blend*unet_correction
-                    raw = (1.0 - blend) * canny_steer + blend * unet_raw
-                    raw = float(np.clip(raw, -1.0, 1.0))
-                    logger.debug(
-                        f"UNET BLEND: off-center {abs_unet:.0%}, blend={blend:.2f} "
-                        f"canny={canny_steer:+.3f} unet={unet_raw:+.3f} → raw={raw:+.3f}"
-                    )
+            # ── UNet safety override (bất kể tier nào) ──
+            abs_unet = abs(unet_raw)
+            if abs_unet > UNET_EMERGENCY_THRESHOLD:
+                raw = float(np.clip(unet_raw * UNET_EMERGENCY_GAIN, -1.0, 1.0))
+                logger.warning(
+                    f"UNET EMERGENCY: off-center {abs_unet:.0%}! "
+                    f"tx={tx_steer} canny={canny_steer} unet={unet_raw:+.3f} → override={raw:+.3f}"
+                )
+            elif abs_unet > UNET_WARN_THRESHOLD:
+                blend = ((abs_unet - UNET_WARN_THRESHOLD) /
+                         (UNET_EMERGENCY_THRESHOLD - UNET_WARN_THRESHOLD))
+                blend = min(blend, 1.0) * UNET_BLEND_GAIN
+                raw = (1.0 - blend) * raw + blend * unet_raw
+                raw = float(np.clip(raw, -1.0, 1.0))
 
-                # No extra EMA — canny output is already smoothed
+            # EMA smoothing
+            if primary_source in ('target_x', 'target_x+canny'):
+                # Target X output already has EMA internally
+                self._ema_correction = raw
+            elif primary_source == 'canny':
+                # Canny output already smoothed
                 self._ema_correction = raw
             else:
-                # Canny unavailable → fallback to UNet with EMA smoothing
-                raw = unet_raw
+                # UNet fallback: apply EMA
                 self._ema_correction = EMA_ALPHA * raw + (1.0 - EMA_ALPHA) * self._ema_correction
 
             if abs(raw) > 0.01:
                 logger.debug(
-                    f"Lane: canny={'N/A' if canny_steer is None else f'{canny_steer:+.3f}'} "
-                    f"unet={unet_raw:+.3f} raw={raw:+.3f} final={self._ema_correction:+.3f} "
-                    f"primary={'canny' if canny_steer is not None else 'unet'}"
+                    f"Lane: tx={tx_steer and f'{tx_steer:+.3f}'} conf={tx_conf:.1f} "
+                    f"canny={'N/A' if canny_steer is None else f'{canny_steer:+.3f}'} "
+                    f"unet={unet_raw:+.3f} → {self._ema_correction:+.3f} [{primary_source}]"
                 )
 
             return self._ema_correction

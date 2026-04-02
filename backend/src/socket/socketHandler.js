@@ -285,6 +285,61 @@ function setupSocket(io) {
             io.emit('sign-detect-result', data);
         });
 
+        // ====== Object Detection Events (Python detect-object container) ======
+        // Frontend → detect-object container: start/stop/once
+        socket.on('object-detect-start', async () => {
+            try {
+                const detectUrl = process.env.DETECT_OBJECT_URL || 'http://detect-object:9002';
+                await fetch(`${detectUrl}/start`, { method: 'POST', signal: AbortSignal.timeout(5000) });
+            } catch (err) {
+                console.error('object-detect-start error:', err.message);
+                socket.emit('object-detect-status', { detecting: false, error: err.message });
+            }
+        });
+
+        socket.on('object-detect-stop', async () => {
+            try {
+                const detectUrl = process.env.DETECT_OBJECT_URL || 'http://detect-object:9002';
+                await fetch(`${detectUrl}/stop`, { method: 'POST', signal: AbortSignal.timeout(5000) });
+            } catch (err) {
+                console.error('object-detect-stop error:', err.message);
+            }
+        });
+
+        socket.on('object-detect-once', async () => {
+            try {
+                const detectUrl = process.env.DETECT_OBJECT_URL || 'http://detect-object:9002';
+                await fetch(`${detectUrl}/detect_once`, { method: 'POST', signal: AbortSignal.timeout(10000) });
+            } catch (err) {
+                console.error('object-detect-once error:', err.message);
+                socket.emit('object-detect-result', { detections: [], error: err.message });
+            }
+        });
+
+        // Frontend → detect-object container: set target color
+        socket.on('object-detect-set-target', async (data) => {
+            try {
+                const detectUrl = process.env.DETECT_OBJECT_URL || 'http://detect-object:9002';
+                await fetch(`${detectUrl}/set_target`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(data || {}),
+                    signal: AbortSignal.timeout(5000),
+                });
+            } catch (err) {
+                console.error('object-detect-set-target error:', err.message);
+                socket.emit('object-detect-status', { error: err.message });
+            }
+        });
+
+        // detect-object container → Frontend: detection results & status
+        socket.on('object-detect-result', (data) => {
+            io.to('admin').emit('object-detect-result', data);
+        });
+        socket.on('object-detect-status', (data) => {
+            io.to('admin').emit('object-detect-status', data);
+        });
+
         socket.on('disconnect', () => {
             console.log(`Client disconnected: ${socket.id}`);
         });

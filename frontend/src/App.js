@@ -14,6 +14,7 @@ import MapBuilderPage from './pages/MapBuilderPage';
 import MapPage from './pages/MapPage';
 import RfidPage from './pages/RfidPage';
 import MotorCalibrationPage from './pages/MotorCalibrationPage';
+import AdminDetectPage from './pages/AdminDetectPage';
 
 function ProtectedRoute({ children, roles }) {
     const { user, loading } = useAuth();
@@ -44,6 +45,7 @@ function AppRoutes() {
                 <Route path="/admin/map-builder" element={<ProtectedRoute roles={['admin']}><MapBuilderPage /></ProtectedRoute>} />
                 <Route path="/admin/rfid" element={<ProtectedRoute roles={['admin']}><RfidPage /></ProtectedRoute>} />
                 <Route path="/admin/motor-calibration" element={<ProtectedRoute roles={['admin']}><MotorCalibrationPage /></ProtectedRoute>} />
+                <Route path="/admin/detect" element={<ProtectedRoute roles={['admin']}><AdminDetectPage /></ProtectedRoute>} />
                 {/* Map + Dev Debug: combined page */}
                 <Route path="/map" element={<ProtectedRoute roles={['admin']}><MapPage /></ProtectedRoute>} />
                 <Route path="/dev" element={<Navigate to="/map" replace />} />

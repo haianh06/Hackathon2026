@@ -54,11 +54,18 @@ services:
       ENABLE_HARDWARE: "true"
       HARDWARE_DOCKER: "true"
       ROADSIGN_URL: http://roadsign:9001
+      DETECT_OBJECT_URL: http://detect-object:9002
     depends_on:
       mongodb:
         condition: service_healthy
       redis:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"require('http').get('http://localhost:5000/health', r => process.exit(r.statusCode===200?0:1))\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
     networks:
       - app-network
 
@@ -78,8 +85,12 @@ services:
     volumes:
       - /dev:/dev
       - /run/udev:/run/udev:ro
+      - /sys/class/pwm:/sys/class/pwm
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    env_file:
+      - ./hardware.env
+      - ./canny.env
     environment:
       SERVER_URL: http://backend:5000
       CAMERA_HOST: host.docker.internal
@@ -91,6 +102,12 @@ services:
       PYTHONUNBUFFERED: "1"
     depends_on:
       - backend
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8765/camera/status')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
     networks:
       - app-network
 
@@ -145,6 +162,30 @@ services:
     depends_on:
       - backend
       - hardware
+    networks:
+      - app-network
+
+  # ===== Object Detector (Python — custom detection algorithms) =====
+  detect-object:
+    build:
+      context: ./backend
+      dockerfile: detect-object/Dockerfile
+    container_name: hackathon-detect-object
+    restart: unless-stopped
+    ports:
+      - "9002:9002"
+    environment:
+      BACKEND_URL: http://backend:5000
+      CAMERA_MJPEG_URL: http://hardware:8765/stream
+      DETECT_PORT: "9002"
+      DETECT_INTERVAL_MS: "500"
+      CONF_THRESHOLD: "0.5"
+      PYTHONUNBUFFERED: "1"
+    depends_on:
+      backend:
+        condition: service_healthy
+      hardware:
+        condition: service_healthy
     networks:
       - app-network
 

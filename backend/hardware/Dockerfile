@@ -17,6 +17,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Install base Python dependencies first (better layer caching)
 COPY hardware/requirements.txt ./hardware/requirements.txt
 RUN pip install --no-cache-dir \
+    "rpi-hardware-pwm>=0.2.0" \
     "lgpio" \
     "spidev" \
     "aiohttp>=3.9.0" \

@@ -30,11 +30,11 @@ except FileNotFoundError:
     CONFIG = {}
 
 # Import hardware modules
-from motor_control import create_motor_controller, AutoNavigator
+from motor_control import create_motor_controller, AutoNavigator, LEFT_MIRROR, LEFT_NEUTRAL, RIGHT_NEUTRAL
 from camera_mjpeg import CameraManager
 from line_follower import LineFollower
 
-# RFID reader (custom spidev + lgpio driver for Pi 5)
+# RFID reader (custom spidev + lgpio driver for RST pin)
 try:
     from rfid_reader import MFRC522Reader
     RFID_AVAILABLE = True
@@ -95,7 +95,7 @@ class HardwareDaemon:
         self._map_y = 0  # grid coordinate y
         self._map_direction = 0  # 0=up(+y), 1=right(+x), 2=down(-y), 3=left(-x)
         self._map_step_count = 0
-        self._lane_tracker = AdaptiveTrackerV2(width=640, height=480) if CANNY_AVAILABLE else None
+        self._lane_tracker = AdaptiveTrackerV2() if CANNY_AVAILABLE else None
 
         # ── RFID scanner state ──
         self._rfid_scanning = False
@@ -132,18 +132,15 @@ class HardwareDaemon:
         self._calibrate_running = False
 
     def _calibrate_pwm(self, pin_name, pulse_us):
-        """Apply PWM for calibration, inverting left motor around 1500µs.
-        Left servo is mirror-mounted, so its direction is inverted:
-        left_actual = 3000 - pulse_us (e.g. 1800→1200, 1300→1700)
-        This makes both motors respond in the same physical direction
-        for the same commanded pulse value."""
-        if pin_name == 'left':
+        """Apply PWM for calibration.
+        If LEFT_MIRROR is set (env MOTOR_LEFT_MIRROR=1), the left motor
+        pulse is inverted around 3000µs for mirror-mounted servos."""
+        if pin_name == 'left' and LEFT_MIRROR:
             actual = 3000 - pulse_us
         else:
             actual = pulse_us
-        target_pin = self.motor.left_pin if pin_name == 'left' else self.motor.right_pin
         if hasattr(self.motor, '_set_pwm'):
-            self.motor._set_pwm(target_pin, actual)
+            self.motor._set_pwm(pin_name, actual)
 
     async def connect_to_server(self):
         """Connect to Node.js backend via Socket.IO"""
@@ -411,7 +408,7 @@ class HardwareDaemon:
         and only add drift-bias compensation for mechanical offset.
 
           1. Start driving forward
-          2. Every ~80ms: grab frame → canny process_frame → get steer → adjust motor
+          2. Every ~80ms: grab frame → target X + canny + UNet → get steer → adjust motor
           3. Stop after step_duration
         """
         import time as _time
@@ -425,35 +422,31 @@ class HardwareDaemon:
 
         try:
 
+            # Reset line follower state for new segment
+            if self.line_follower and hasattr(self.line_follower, 'reset'):
+                self.line_follower.reset()
+
             # Start driving
             self.motor.forward(speed)
             start_time = _time.time()
-            last_canny_steer = 0.0
+            last_steer = 0.0
             frames_ok = 0
 
             while (_time.time() - start_time) < step_duration:
                 loop_start = _time.time()
 
-                # ── Grab frame and detect ──
-                canny_steer = 0.0
+                # ── Grab frame → 3-tier steering (target X → canny → UNet) ──
+                lane_steer = 0.0
 
                 frame_bytes = await self.camera.get_latest_frame()
-                if frame_bytes and CANNY_AVAILABLE and self._lane_tracker:
+                if frame_bytes and self.line_follower and self.line_follower.is_ready:
                     try:
-                        nparr = np.frombuffer(frame_bytes, np.uint8)
-                        frame_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                        if frame_bgr is not None:
-                            frame_bgr = cv2.resize(frame_bgr, (640, 480))
-                            steer_val, _ = self._lane_tracker.process_frame(frame_bgr)
-                            canny_steer = steer_val
-                            frames_ok += 1
+                        lane_steer = self.line_follower.analyse_frame(frame_bytes)
+                        frames_ok += 1
                     except Exception as e:
                         logger.debug(f"Step loop detect error: {e}")
 
-                # ── Use canny steer directly ──
-                # Canny's process_frame() already has PD controller + EMA.
-                # We only add minimal drift bias correction here.
-                error = canny_steer
+                error = lane_steer
 
                 # ── Drift bias (long-term mechanical offset) ──
                 self._drift_ema = self._drift_alpha * error + (1 - self._drift_alpha) * self._drift_ema
@@ -464,8 +457,8 @@ class HardwareDaemon:
                     if drift_std < 0.25 and abs(drift_mean) > 0.04:
                         self._drift_bias = -0.25 * drift_mean
 
-                # ── Final steer: canny output + drift bias only ──
-                final_steer = max(-1.0, min(1.0, canny_steer + self._drift_bias))
+                # ── Final steer: lane output + drift bias ──
+                final_steer = max(-1.0, min(1.0, lane_steer + self._drift_bias))
 
                 # ── Apply to motor ──
                 if abs(final_steer) > DEAD_ZONE:
@@ -477,7 +470,7 @@ class HardwareDaemon:
                 self._drift_history.append((error, LOOP_INTERVAL))
                 if len(self._drift_history) > 60:
                     self._drift_history = self._drift_history[-40:]
-                last_canny_steer = canny_steer
+                last_steer = lane_steer
 
                 # Sleep remainder of loop interval
                 elapsed = _time.time() - loop_start
@@ -678,13 +671,14 @@ class HardwareDaemon:
 
         t0 = asyncio.get_event_loop().time()
 
-        # Initial neutral reading
+        # Initial neutral reading (use per-motor neutral)
         for pname in pin_names:
-            self._calibrate_pwm(pname, 1500)
+            neutral = LEFT_NEUTRAL if pname == 'left' else RIGHT_NEUTRAL
+            self._calibrate_pwm(pname, neutral)
         if self.sio and self.sio.connected:
             await self.sio.emit('motor-calibrate-data', {
                 'type': 'step', 'pin': pin,
-                'pulse_us': 1500, 'time': 0.0, 'phase': 'idle'
+                'pulse_us': 0, 'time': 0.0, 'phase': 'idle'
             })
         await asyncio.sleep(0.5)
 
@@ -715,8 +709,8 @@ class HardwareDaemon:
         self._calibrate_running = False
 
     async def _run_deadband_test(self, data):
-        """Find motor dead band by sweeping outward from 1500µs in small steps.
-        Sweeps forward (1500→1500+max) then reverse (1500→1500-max).
+        """Find motor dead band by sweeping outward from neutral in small steps.
+        Sweeps forward (neutral→neutral+max) then reverse (neutral→neutral-max).
         User observes when motor starts spinning to determine dead zone edges."""
         pin = data.get('pin', 'both')
         step_us = int(data.get('step_us', 1))
@@ -735,14 +729,15 @@ class HardwareDaemon:
         for offset in range(0, max_offset + 1, step_us):
             if not self._calibrate_running:
                 break
-            pulse = 1500 + offset
             for pname in pin_names:
+                neutral = LEFT_NEUTRAL if pname == 'left' else RIGHT_NEUTRAL
+                pulse = neutral + offset
                 self._calibrate_pwm(pname, pulse)
             elapsed = asyncio.get_event_loop().time() - t0
             if self.sio and self.sio.connected:
                 await self.sio.emit('motor-calibrate-data', {
                     'type': 'deadband', 'pin': pin,
-                    'pulse_us': pulse, 'offset': offset,
+                    'offset': offset,
                     'direction': 'forward',
                     'time': round(elapsed, 3),
                     'phase': 'forward'
@@ -751,21 +746,23 @@ class HardwareDaemon:
 
         # Return to neutral briefly
         for pname in pin_names:
-            self._calibrate_pwm(pname, 1500)
+            neutral = LEFT_NEUTRAL if pname == 'left' else RIGHT_NEUTRAL
+            self._calibrate_pwm(pname, neutral)
         await asyncio.sleep(0.3)
 
         # Phase 2: Sweep reverse (below neutral)
         for offset in range(0, max_offset + 1, step_us):
             if not self._calibrate_running:
                 break
-            pulse = 1500 - offset
             for pname in pin_names:
+                neutral = LEFT_NEUTRAL if pname == 'left' else RIGHT_NEUTRAL
+                pulse = neutral - offset
                 self._calibrate_pwm(pname, pulse)
             elapsed = asyncio.get_event_loop().time() - t0
             if self.sio and self.sio.connected:
                 await self.sio.emit('motor-calibrate-data', {
                     'type': 'deadband', 'pin': pin,
-                    'pulse_us': pulse, 'offset': -offset,
+                    'offset': -offset,
                     'direction': 'reverse',
                     'time': round(elapsed, 3),
                     'phase': 'reverse'
@@ -983,7 +980,7 @@ class HardwareDaemon:
                                 nparr = np.frombuffer(frame_bytes, np.uint8)
                                 frame_bgr = _cv2.imdecode(nparr, _cv2.IMREAD_COLOR)
                                 if frame_bgr is not None:
-                                    frame_bgr = _cv2.resize(frame_bgr, (640, 480))
+                                    frame_bgr = _cv2.resize(frame_bgr, (self._lane_tracker.w, self._lane_tracker.h))
                                     steer, vis = self._lane_tracker.process_frame(frame_bgr)
 
                                     # Add position text on viz
@@ -1047,7 +1044,7 @@ class HardwareDaemon:
                     nparr = np.frombuffer(frame_bytes, np.uint8)
                     frame_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
                     if frame_bgr is not None:
-                        frame_bgr = cv2.resize(frame_bgr, (640, 480))
+                        frame_bgr = cv2.resize(frame_bgr, (self._lane_tracker.w, self._lane_tracker.h))
                         _, vis = self._lane_tracker.process_frame(frame_bgr)
                         _, jpeg = cv2.imencode('.jpg', vis, [cv2.IMWRITE_JPEG_QUALITY, 85])
                         frame_bytes = jpeg.tobytes()
@@ -1297,7 +1294,7 @@ if __name__ == '__main__':
 ║   🤖 Pi Delivery Bot - Hardware Daemon   ║
 ║   Platform: Raspberry Pi 5               ║
 ║   Camera: IMX219 (MJPEG HTTP)            ║
-║   Motor: 2x Servo (lgpio PWM GPIO12,13)  ║
+║   Motor: 2x Servo (HW PWM GPIO12,13)     ║
 ╚══════════════════════════════════════════╝
     """)
     asyncio.run(main())

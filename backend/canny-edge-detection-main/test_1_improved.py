@@ -1,6 +1,19 @@
 import cv2
 import numpy as np
+import os
 from typing import Tuple, Optional
+
+
+# ═══════════════════════════════════════════════════════════════
+# Load all parameters from environment variables (canny.env)
+# ═══════════════════════════════════════════════════════════════
+
+def _env_int(key, default):
+    return int(os.environ.get(key, default))
+
+def _env_float(key, default):
+    return float(os.environ.get(key, default))
+
 
 class EMAFilter:
     def __init__(self, alpha: float = 0.4):
@@ -16,137 +29,461 @@ class EMAFilter:
             self.value = (self.alpha * new_value) + ((1.0 - self.alpha) * self.value)
         return float(self.value)
 
+    def reset(self):
+        self.value = None
+
 class AdaptiveTrackerV2:
-    def __init__(self, width: int = 640, height: int = 480):
-        self.w = width
-        self.h = height
-        
-        # ==========================================
-        # 1. THRESHOLD CĂN CHỈNH CAMERA
-        # ==========================================
-        self.camera_x_offset = 0    
-        
-        # ROI gần xe hơn — nhìn khoảng 25% chiều cao phía trước
-        self.y_bottom = int(self.h * 0.85)  # Cạnh dưới (gần xe)
-        self.y_top    = int(self.h * 0.60)  # Cạnh trên (rút ngắn từ 0.40 → 0.60)
-        
-        self.num_scans = 12  # Giảm từ 8 → 6 vì ROI ngắn hơn
-        self.standard_lane_width = int(self.w * 0.6) 
-        
-        # Trạng thái ROI ban đầu
-        self.roi_x = np.array([self.w*0.15, self.w*0.85, self.w*0.30, self.w*0.70], dtype=np.float32)
-        self.roi_ema_alpha = 0.2 
+    """
+    Lane-following tracker dựa trên Cross-Track Error (CTE) + PID controller.
 
-        # PID controller (thêm Ki cho tích phân)
-        self.Kp = 0.85
-        self.Ki = 0.05
-        self.Kd = 0.60
+    Pipeline:
+      1. Perception: Camera → binary mask (vạch trắng)
+      2. Ego-centric: Xe làm gốc tọa độ, frame pixel = hệ tọa độ
+      3. Target fix cứng: Vạch trái & phải phải nằm tại target_left_x, target_right_x
+      4. CTE = (actual_center - target_center) / half_width
+      5. PID controller: u(t) = Kp*e + Ki*∫e + Kd*de/dt
+      6. Pure Pursuit: Khi vào cua, dùng lookahead point thay vì target fix cứng
+      7. Bird's Eye View: BEV overlay ở góc trên trái camera stream
+
+    Tất cả tham số đọc từ env (canny.env).
+    """
+
+    def __init__(self, width: int = None, height: int = None):
+        # ── Frame dimensions ──
+        self.w = width or _env_int('CANNY_FRAME_WIDTH', 640)
+        self.h = height or _env_int('CANNY_FRAME_HEIGHT', 480)
+
+        # ── Camera offset ──
+        self.camera_x_offset = _env_int('CANNY_CAMERA_X_OFFSET', 0)
+
+        # ── ROI ──
+        self.y_bottom = int(self.h * _env_float('CANNY_ROI_BOTTOM_FRAC', 0.85))
+        self.y_top    = int(self.h * _env_float('CANNY_ROI_TOP_FRAC', 0.60))
+        self.num_scans = _env_int('CANNY_NUM_SCANS', 12)
+        self.standard_lane_width = int(self.w * _env_float('CANNY_STANDARD_LANE_WIDTH_FRAC', 0.6))
+
+        # ROI khởi tạo
+        self.roi_x = np.array([
+            self.w * _env_float('CANNY_ROI_INIT_LEFT_BOT', 0.15),
+            self.w * _env_float('CANNY_ROI_INIT_RIGHT_BOT', 0.85),
+            self.w * _env_float('CANNY_ROI_INIT_LEFT_TOP', 0.30),
+            self.w * _env_float('CANNY_ROI_INIT_RIGHT_TOP', 0.70),
+        ], dtype=np.float32)
+        self.roi_ema_alpha = _env_float('CANNY_ROI_EMA_ALPHA', 0.2)
+
+        # ── Target fix cứng (Ego-centric) — cố định theo pixel khung hình ──
+        self.target_left_x  = _env_int('CANNY_TARGET_LEFT_X', 140)
+        self.target_right_x = _env_int('CANNY_TARGET_RIGHT_X', 500)
+        self.target_center_x = (self.target_left_x + self.target_right_x) // 2
+        # Dòng quét target X: đẩy trọng tâm lên cao hơn baseline
+        # để xe bị lệch vẫn thấy được vạch 2 bên (% chiều cao frame)
+        self.target_x_scan_y = int(self.h * _env_float('CANNY_TARGET_X_SCAN_Y_FRAC', 0.70))
+
+        # ── PID Controller ──
+        self.Kp = _env_float('CANNY_PID_KP', 0.85)
+        self.Ki = _env_float('CANNY_PID_KI', 0.05)
+        self.Kd = _env_float('CANNY_PID_KD', 0.60)
         self._integral = 0.0
-        self._integral_max = 2.0  # Anti-windup clamp
-        self.steer_ema = EMAFilter(alpha=0.3)
+        self._integral_max = _env_float('CANNY_PID_INTEGRAL_MAX', 2.0)
+        self._prev_cte = 0.0
+        self.steer_ema = EMAFilter(alpha=_env_float('CANNY_PID_STEER_EMA_ALPHA', 0.3))
 
-        # ==========================================
-        # Baseline calibration — đường ngang đáy ROI
-        # Nơi mà 2 vạch trắng cân bằng nhau
-        # ==========================================
-        self.baseline_y = self.y_bottom  # Vị trí baseline = đáy ROI
-        self.baseline_balance = 0.0      # Độ lệch tại baseline (-1..+1)
+        # ── Target X centering PID (separate from process_frame PID) ──
+        self._tx_integral = 0.0
+        self._tx_prev_cte = 0.0
+        self._tx_steer_ema = EMAFilter(alpha=_env_float('CANNY_PID_STEER_EMA_ALPHA', 0.3))
 
-        # ==========================================
-        # Intersection ROI locking
-        # ==========================================
-        self.roi_locked = False           # True khi đã lock ROI tại ngã rẽ
-        self.locked_y_top = None          # y_top cố định khi lock
-        self.locked_roi_x = None          # ROI x cố định khi lock
-        self._intersection_cooldown = 0   # Frame cooldown sau khi unlock
+        # ── Pure Pursuit ──
+        self.pursuit_lookahead_min = _env_int('CANNY_PURSUIT_LOOKAHEAD_MIN', 60)
+        self.pursuit_lookahead_max = _env_int('CANNY_PURSUIT_LOOKAHEAD_MAX', 180)
+        self.pursuit_gain = _env_float('CANNY_PURSUIT_GAIN', 1.2)
+
+        # ── Bird's Eye View ──
+        self.bev_w = _env_int('CANNY_BEV_WIDTH', 200)
+        self.bev_h = _env_int('CANNY_BEV_HEIGHT', 200)
+        self._bev_matrix = self._compute_bev_matrix()
+
+        # ── Drift Compensation ──
+        self.drift_compensation = _env_float('CANNY_DRIFT_COMPENSATION', 0.04)
+        self.left_drift_boost = _env_float('CANNY_LEFT_DRIFT_BOOST', 1.25)
+
+        # ── Baseline ──
+        self.baseline_y = self.y_bottom
+        self.baseline_balance = 0.0
+
+        # ── Intersection detection ──
+        self.roi_locked = False
+        self.locked_y_top = None
+        self.locked_roi_x = None
+        self._intersection_cooldown = 0
+        self._intersection_confirm = 0
+        self._intersection_confirm_threshold = _env_int('CANNY_INTERSECTION_CONFIRM_THRESHOLD', 3)
+        self._intersection_cooldown_frames = _env_int('CANNY_INTERSECTION_COOLDOWN_FRAMES', 15)
+
+        # ── Binary mask params ──
+        self._binary_threshold = _env_int('CANNY_BINARY_THRESHOLD', 180)
+        self._blur_kernel = _env_int('CANNY_BLUR_KERNEL', 5)
+        self._morph_kernel_size = _env_int('CANNY_MORPH_KERNEL', 3)
+
+    def _compute_bev_matrix(self) -> np.ndarray:
+        """Tính ma trận perspective transform cho Bird's Eye View."""
+        fw, fh = float(self.w), float(self.h)
+        bw, bh = float(self.bev_w), float(self.bev_h)
+
+        src = np.float32([
+            [fw * _env_float('CANNY_BEV_SRC_TL_X', 0.30), fh * _env_float('CANNY_BEV_SRC_TL_Y', 0.50)],
+            [fw * _env_float('CANNY_BEV_SRC_TR_X', 0.70), fh * _env_float('CANNY_BEV_SRC_TR_Y', 0.50)],
+            [fw * _env_float('CANNY_BEV_SRC_BR_X', 1.00), fh * _env_float('CANNY_BEV_SRC_BR_Y', 0.95)],
+            [fw * _env_float('CANNY_BEV_SRC_BL_X', 0.00), fh * _env_float('CANNY_BEV_SRC_BL_Y', 0.95)],
+        ])
+        dst = np.float32([
+            [bw * _env_float('CANNY_BEV_DST_TL_X', 0.10), bh * _env_float('CANNY_BEV_DST_TL_Y', 0.0)],
+            [bw * _env_float('CANNY_BEV_DST_TR_X', 0.90), bh * _env_float('CANNY_BEV_DST_TR_Y', 0.0)],
+            [bw * _env_float('CANNY_BEV_DST_BR_X', 0.90), bh * _env_float('CANNY_BEV_DST_BR_Y', 1.0)],
+            [bw * _env_float('CANNY_BEV_DST_BL_X', 0.10), bh * _env_float('CANNY_BEV_DST_BL_Y', 1.0)],
+        ])
+        return cv2.getPerspectiveTransform(src, dst)
+
+    # ═══════════════════════════════════════════════════════════
+    # Image Processing
+    # ═══════════════════════════════════════════════════════════
 
     def _get_clean_mask(self, bgr_img: np.ndarray) -> np.ndarray:
         gray = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2GRAY)
-        blur = cv2.GaussianBlur(gray, (5, 5), 0)
-        _, mask = cv2.threshold(blur, 180, 255, cv2.THRESH_BINARY)
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        k = self._blur_kernel
+        blur = cv2.GaussianBlur(gray, (k, k), 0)
+        _, mask = cv2.threshold(blur, self._binary_threshold, 255, cv2.THRESH_BINARY)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT,
+                                           (self._morph_kernel_size, self._morph_kernel_size))
         return cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
 
-    def _get_line_edges(self, mask_1d: np.ndarray, expected_x: int, window: int = 80) -> Optional[Tuple[int, int]]:
-        """Tìm rìa trong và rìa ngoài của 1 vạch kẻ trắng"""
+    def _get_bird_eye_view(self, bgr_img: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        """Tạo Bird's Eye View đen trắng từ binary mask (góc nhìn từ trên xuống)."""
+        bev_mask = cv2.warpPerspective(mask, self._bev_matrix,
+                                        (self.bev_w, self.bev_h))
+        # Ảnh đen trắng: vạch trắng trên nền đen
+        bev_bw = np.zeros((self.bev_h, self.bev_w, 3), dtype=np.uint8)
+        bev_bw[bev_mask > 0] = (255, 255, 255)
+
+        # Vẽ target lines trên BEV
+        target_pts_src = np.float32([
+            [[self.target_left_x, self.y_bottom]],
+            [[self.target_right_x, self.y_bottom]],
+            [[self.target_center_x, self.y_bottom]],
+        ])
+        target_pts_bev = cv2.perspectiveTransform(target_pts_src, self._bev_matrix)
+
+        labels = ["TL", "TR", "TC"]
+        colors = [(0, 0, 255), (255, 0, 0), (0, 255, 255)]
+        for i in range(3):
+            pt = target_pts_bev[i][0]
+            x, y = int(pt[0]), int(pt[1])
+            if 0 <= x < self.bev_w and 0 <= y < self.bev_h:
+                cv2.circle(bev_bw, (x, y), 4, colors[i], -1)
+                cv2.putText(bev_bw, labels[i], (x + 5, y - 3),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.3, colors[i], 1)
+
+        cv2.rectangle(bev_bw, (0, 0), (self.bev_w - 1, self.bev_h - 1), (128, 128, 128), 1)
+        cv2.putText(bev_bw, "BEV", (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+
+        return bev_bw
+
+    def _get_line_edges(self, mask_1d: np.ndarray, expected_x: int,
+                        window: int = 80) -> Optional[Tuple[int, int]]:
+        """Tìm rìa trong và rìa ngoài của 1 vạch kẻ trắng."""
         start = max(0, expected_x - window)
         end = min(self.w, expected_x + window)
         local_slice = mask_1d[start:end]
         white_indices = np.where(local_slice > 0)[0]
-        
-        if len(white_indices) < 3: return None
-            
+
+        if len(white_indices) < 3:
+            return None
+
         l_edge_local = white_indices[0]
         r_edge_local = white_indices[-1]
-        
-        # Bỏ qua nếu vệt trắng quá lớn (ví dụ: ngã tư, nhiễu ánh sáng)
-        if (r_edge_local - l_edge_local) > (end - start) * 0.6: return None
-            
+
+        if (r_edge_local - l_edge_local) > (end - start) * 0.6:
+            return None
+
         return start + l_edge_local, start + r_edge_local
 
-    def _detect_intersection(self, mask: np.ndarray) -> Optional[int]:
-        """Detect horizontal white line (intersection) above the ROI.
+    # ═══════════════════════════════════════════════════════════
+    # Intersection Detection (Hough Transform)
+    # ═══════════════════════════════════════════════════════════
 
-        Scans rows from y_top upward looking for a row with a wide
-        continuous white segment spanning >40% of frame width.
-        Returns the y coordinate of that line, or None.
-        """
-        scan_start = max(0, self.y_top - 80)
-        for y in range(self.y_top, scan_start, -2):
-            row = mask[y, :]
-            white_ratio = np.count_nonzero(row) / self.w
-            if white_ratio > 0.40:
-                return y
+    def _detect_intersection(self, mask: np.ndarray) -> Optional[int]:
+        """Detect horizontal white line (intersection) above the ROI."""
+        scan_top = max(0, self.y_top - 100)
+        scan_bottom = self.y_top + 20
+        if scan_top >= scan_bottom:
+            return None
+
+        region = mask[scan_top:scan_bottom, :]
+        if region.size == 0:
+            return None
+
+        white_ratio = np.count_nonzero(region) / region.size
+        if white_ratio < 0.08 or white_ratio > 0.70:
+            return None
+
+        edges = cv2.Canny(region, 50, 150)
+        lines = cv2.HoughLinesP(
+            edges, rho=1, theta=np.pi / 180, threshold=40,
+            minLineLength=int(self.w * 0.20), maxLineGap=30,
+        )
+        if lines is None:
+            return None
+
+        best_y = None
+        best_span = 0
+        max_angle_deg = 20
+
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            dx = abs(x2 - x1)
+            dy = abs(y2 - y1)
+            angle = np.degrees(np.arctan2(dy, dx + 1e-5))
+            if angle > max_angle_deg:
+                continue
+            span = abs(x2 - x1)
+            if span < self.w * 0.25:
+                continue
+
+            mid_y = (y1 + y2) // 2
+            mid_y = max(0, min(mid_y, region.shape[0] - 1))
+            strip_top = max(0, mid_y - 3)
+            strip_bot = min(region.shape[0], mid_y + 4)
+            strip = region[strip_top:strip_bot, min(x1, x2):max(x1, x2)]
+            if strip.size > 0:
+                strip_white = np.count_nonzero(strip) / strip.size
+                if strip_white < 0.30:
+                    continue
+
+            if span > best_span:
+                best_span = span
+                best_y = scan_top + (y1 + y2) // 2
+
+        if best_y is not None and best_span >= self.w * 0.35:
+            return best_y
         return None
 
     def unlock_roi(self):
-        """Unlock a previously locked ROI (call after completing a turn)."""
+        """Unlock ROI sau khi hoàn thành rẽ tại ngã tư."""
         self.roi_locked = False
         self.locked_y_top = None
         self.locked_roi_x = None
-        self._intersection_cooldown = 15  # Skip detection for 15 frames
+        self._intersection_confirm = 0
+        self._intersection_cooldown = self._intersection_cooldown_frames
+
+    def reset_target_x(self):
+        """Reset Target X PID state — gọi khi bắt đầu segment mới."""
+        self._tx_integral = 0.0
+        self._tx_prev_cte = 0.0
+        self._tx_steer_ema.reset()
+
+    # ═══════════════════════════════════════════════════════════
+    # Target X Lane Centering (PRIMARY steering source)
+    # ═══════════════════════════════════════════════════════════
+
+    def get_target_x_steering(self, frame: np.ndarray):
+        """
+        Lightweight target-X lane centering (PRIMARY steering source).
+
+        Quét vùng baseline tìm rìa trong (inner edge) của vạch trái/phải.
+        So sánh tâm thực tế với target_center_x cố định.
+        Nếu tâm xe nằm giữa target trái & phải → giữa làn.
+        Nếu lệch → tính PID steering để kéo xe về trọng tâm.
+
+        Returns: (steering, confidence, actual_left_inner, actual_right_inner)
+          steering: float [-1, +1]
+          confidence: 0.0 (không tìm thấy), 0.5 (1 vạch), 1.0 (2 vạch)
+        """
+        mask = self._get_clean_mask(frame)
+        car_cx = (self.w // 2) + self.camera_x_offset
+
+        # Quét nhiều dải hàng từ scan_y đến baseline để tăng tin cậy
+        scan_y = self.target_x_scan_y
+        band = 4
+        # Gộp nhiều hàng quét (scan_y và baseline) để bắt vạch tốt hơn
+        scan_rows = [scan_y, (scan_y + self.y_bottom) // 2, self.y_bottom]
+        row = np.zeros(self.w, dtype=np.uint8)
+        for sy in scan_rows:
+            sy = max(band, min(self.h - band, sy))
+            row_slice = np.max(mask[sy - band:sy + band, :], axis=0)
+            row = np.maximum(row, row_slice)
+
+        # Tìm tất cả đoạn trắng (white runs)
+        padded = np.concatenate(([0], (row > 0).astype(np.uint8), [0]))
+        diff = np.diff(padded)
+        starts = np.where(diff == 1)[0]
+        ends = np.where(diff == -1)[0]
+
+        if len(starts) == 0:
+            return 0.0, 0.0, None, None
+
+        # Lọc đoạn trắng hợp lệ (kích thước vạch kẻ đường)
+        min_line_w = 3
+        max_line_w = int(self.w * 0.15)
+
+        left_inner = None
+        right_inner = None
+        confidence = 0.0
+
+        # Tìm vạch gần nhất bên trái tâm xe
+        best_left_dist = float('inf')
+        for s, e in zip(starts, ends):
+            w = e - s
+            if w < min_line_w or w > max_line_w:
+                continue
+            inner_edge = e  # rìa phải của vạch = rìa trong lane bên trái
+            if inner_edge < car_cx:
+                dist = car_cx - inner_edge
+                if dist < best_left_dist:
+                    best_left_dist = dist
+                    left_inner = inner_edge
+
+        # Tìm vạch gần nhất bên phải tâm xe
+        best_right_dist = float('inf')
+        for s, e in zip(starts, ends):
+            w = e - s
+            if w < min_line_w or w > max_line_w:
+                continue
+            inner_edge = s  # rìa trái của vạch = rìa trong lane bên phải
+            if inner_edge > car_cx:
+                dist = inner_edge - car_cx
+                if dist < best_right_dist:
+                    best_right_dist = dist
+                    right_inner = inner_edge
+
+        if left_inner is not None:
+            confidence += 0.5
+        if right_inner is not None:
+            confidence += 0.5
+
+        # Suy luận vạch còn thiếu từ standard lane width
+        if left_inner is not None and right_inner is None:
+            right_inner = left_inner + self.standard_lane_width
+        elif right_inner is not None and left_inner is None:
+            left_inner = right_inner - self.standard_lane_width
+
+        if left_inner is None and right_inner is None:
+            return 0.0, 0.0, None, None
+
+        # CTE = (actual_center - target_center) / half_width
+        actual_center = (left_inner + right_inner) / 2.0
+        half_w = self.w / 2.0
+        cte = (actual_center - self.target_center_x) / half_w
+
+        # PID
+        self._tx_integral += cte
+        self._tx_integral = np.clip(self._tx_integral,
+                                    -self._integral_max, self._integral_max)
+        d_cte = cte - self._tx_prev_cte
+        self._tx_prev_cte = cte
+
+        kp = self.Kp if cte >= 0 else self.Kp * self.left_drift_boost
+        steering = kp * cte + self.Ki * self._tx_integral + self.Kd * d_cte
+        steering = float(np.clip(steering + self.drift_compensation, -1.0, 1.0))
+        steering = self._tx_steer_ema.update(steering)
+
+        return steering, confidence, left_inner, right_inner
+
+    # ═══════════════════════════════════════════════════════════
+    # Pure Pursuit — Lookahead point trên center path
+    # ═══════════════════════════════════════════════════════════
+
+    def _pure_pursuit_steer(self, center_path_pts: list,
+                             car_x: int, car_y: int) -> Optional[float]:
+        """
+        Pure Pursuit: tìm lookahead point trên center_path và tính góc lái.
+
+        center_path_pts: list of (x, y) sorted từ bottom → top.
+        car_x, car_y: vị trí xe (tâm frame, đáy ROI).
+
+        Returns: steer in [-1, +1] or None.
+        """
+        if len(center_path_pts) < 3:
+            return None
+
+        la_min = self.pursuit_lookahead_min
+        la_max = self.pursuit_lookahead_max
+
+        # Ước lượng độ cong
+        dx_path = abs(center_path_pts[-1][0] - center_path_pts[0][0])
+        curvature = min(dx_path / (self.w * 0.5 + 1e-5), 1.0)
+        lookahead_dist = la_max - curvature * (la_max - la_min)
+
+        # Tìm điểm gần nhất với lookahead distance
+        best_pt = None
+        best_dist_diff = float('inf')
+        for (px, py) in center_path_pts:
+            d = np.sqrt((px - car_x) ** 2 + (py - car_y) ** 2)
+            diff = abs(d - lookahead_dist)
+            if diff < best_dist_diff:
+                best_dist_diff = diff
+                best_pt = (px, py)
+
+        if best_pt is None:
+            return None
+
+        lateral_offset = best_pt[0] - car_x
+        ld = np.sqrt((best_pt[0] - car_x) ** 2 + (best_pt[1] - car_y) ** 2)
+        if ld < 1.0:
+            return 0.0
+
+        steer = self.pursuit_gain * (2.0 * lateral_offset) / (ld * ld) * ld
+        return float(np.clip(steer, -1.0, 1.0))
+
+    # ═══════════════════════════════════════════════════════════
+    # Main Processing Pipeline
+    # ═══════════════════════════════════════════════════════════
 
     def process_frame(self, frame: np.ndarray):
         mask = self._get_clean_mask(frame)
         viz_frame = frame.copy()
         car_center_x = (self.w // 2) + self.camera_x_offset
 
+        # ── Bird's Eye View ──
+        bev_img = self._get_bird_eye_view(frame, mask)
+
         # ── Intersection ROI locking ──
         active_y_top = self.y_top
         active_roi_x = self.roi_x.copy()
 
         if self.roi_locked and self.locked_y_top is not None:
-            # ROI đã lock → dùng giá trị cố định
             active_y_top = self.locked_y_top
             active_roi_x = self.locked_roi_x.copy()
         else:
-            # Kiểm tra ngã rẽ
             if self._intersection_cooldown > 0:
                 self._intersection_cooldown -= 1
+                self._intersection_confirm = 0
             else:
                 intersection_y = self._detect_intersection(mask)
                 if intersection_y is not None:
-                    # Lock ROI — đỉnh chạm vạch trắng ngang
-                    self.roi_locked = True
-                    self.locked_y_top = intersection_y
-                    self.locked_roi_x = self.roi_x.copy()
-                    active_y_top = intersection_y
+                    self._intersection_confirm += 1
+                    if self._intersection_confirm >= self._intersection_confirm_threshold:
+                        self.roi_locked = True
+                        self.locked_y_top = intersection_y
+                        self.locked_roi_x = self.roi_x.copy()
+                        active_y_top = intersection_y
+                else:
+                    self._intersection_confirm = max(0, self._intersection_confirm - 1)
 
         l_bot_exp, r_bot_exp, l_top_exp, r_top_exp = active_roi_x
         y_steps = np.linspace(self.y_bottom, active_y_top, self.num_scans, dtype=int)
-        
+
         valid_l_pts, valid_r_pts = [], []
         center_path_pts = []
-        
-        # Màu sắc hiển thị
-        COLOR_OUTER = (150, 0, 0)   # Xanh sẫm (rìa ngoài)
-        COLOR_INNER = (255, 255, 0) # Xanh lơ (rìa trong)
-        COLOR_MID = (0, 255, 255)   # Vàng (trung điểm vạch)
-        COLOR_CENTER = (0, 0, 255)  # Đỏ (tâm làn đường)
 
-        # ==========================================
-        # BƯỚC 1: QUÉT TÌM CẠNH, ĐIỂM VÀ VẼ LƯỚI
-        # ==========================================
+        COLOR_OUTER = (150, 0, 0)
+        COLOR_INNER = (255, 255, 0)
+        COLOR_MID = (0, 255, 255)
+        COLOR_CENTER = (0, 0, 255)
+        COLOR_TARGET = (0, 255, 0)
+
+        # ══════════════════════════════════════════════════
+        # BƯỚC 1: Quét tìm cạnh lane, tính center path
+        # ══════════════════════════════════════════════════
         baseline_l_mid = None
         baseline_r_mid = None
 
@@ -154,15 +491,14 @@ class AdaptiveTrackerV2:
             ratio = (self.y_bottom - y) / (self.y_bottom - active_y_top + 1e-5)
             exp_l = int(l_bot_exp + ratio * (l_top_exp - l_bot_exp))
             exp_r = int(r_bot_exp + ratio * (r_top_exp - r_bot_exp))
-            
-            row_slice = np.max(mask[max(0, y-2):min(self.h, y+2), :], axis=0)
-            
+
+            row_slice = np.max(mask[max(0, y - 2):min(self.h, y + 2), :], axis=0)
+
             l_edges = self._get_line_edges(row_slice, exp_l, window=60)
             r_edges = self._get_line_edges(row_slice, exp_r, window=60)
-            
+
             l_mid_val, r_mid_val = None, None
 
-            # Xử lý vạch trái
             if l_edges:
                 l_out, l_in = l_edges
                 l_mid_val = (l_out + l_in) // 2
@@ -172,7 +508,6 @@ class AdaptiveTrackerV2:
                 cv2.circle(viz_frame, (l_in, y), 3, COLOR_INNER, -1)
                 cv2.circle(viz_frame, (l_mid_val, y), 3, COLOR_MID, -1)
 
-            # Xử lý vạch phải
             if r_edges:
                 r_in, r_out = r_edges
                 r_mid_val = (r_in + r_out) // 2
@@ -182,12 +517,10 @@ class AdaptiveTrackerV2:
                 cv2.circle(viz_frame, (r_out, y), 3, COLOR_OUTER, -1)
                 cv2.circle(viz_frame, (r_mid_val, y), 3, COLOR_MID, -1)
 
-            # Lưu giá trị tại baseline (scan line gần y_bottom nhất)
-            if y == y_steps[0]:  # y_steps[0] = y_bottom
+            if y == y_steps[0]:
                 baseline_l_mid = l_mid_val
                 baseline_r_mid = r_mid_val
 
-            # Dự đoán nếu thiếu 1 bên
             if l_mid_val is not None and r_mid_val is None:
                 r_mid_val = l_mid_val + self.standard_lane_width
             elif r_mid_val is not None and l_mid_val is None:
@@ -199,22 +532,59 @@ class AdaptiveTrackerV2:
                 center_path_pts.append((center_x, y))
                 cv2.circle(viz_frame, (center_x, y), 4, COLOR_CENTER, -1)
 
-        # ==========================================
-        # BASELINE — đường ngang đáy ROI để căn chỉnh camera
-        # ==========================================
-        # Vẽ đường baseline (đáy ROI) cắt ngang ảnh
+        # ══════════════════════════════════════════════════
+        # VẼ HỆ TRỤC TỌA ĐỘ (Ego-centric Coordinate System)
+        # ══════════════════════════════════════════════════
+        cv2.arrowedLine(viz_frame, (car_center_x, self.h - 10),
+                        (car_center_x, active_y_top - 20),
+                        (200, 200, 200), 2, tipLength=0.03)
+        cv2.putText(viz_frame, "Y", (car_center_x + 5, active_y_top - 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+        cv2.arrowedLine(viz_frame, (20, self.y_bottom),
+                        (self.w - 20, self.y_bottom),
+                        (200, 200, 200), 2, tipLength=0.02)
+        cv2.putText(viz_frame, "X", (self.w - 15, self.y_bottom - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+        cv2.circle(viz_frame, (car_center_x, self.y_bottom), 6, (255, 255, 255), 2)
+        cv2.putText(viz_frame, "O", (car_center_x - 15, self.y_bottom + 18),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+
+        # ══════════════════════════════════════════════════
+        # VẼ TARGET FIX CỨNG — cố định theo pixel khung hình (full height)
+        # ══════════════════════════════════════════════════
+        cv2.line(viz_frame, (self.target_left_x, self.h - 1),
+                 (self.target_left_x, 0), (0, 0, 255), 2, cv2.LINE_AA)
+        cv2.putText(viz_frame, f"TL:{self.target_left_x}",
+                    (self.target_left_x - 30, self.h - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1)
+        cv2.line(viz_frame, (self.target_right_x, self.h - 1),
+                 (self.target_right_x, 0), (255, 0, 0), 2, cv2.LINE_AA)
+        cv2.putText(viz_frame, f"TR:{self.target_right_x}",
+                    (self.target_right_x - 30, self.h - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 0, 0), 1)
+        # Đường tâm nét đứt — cố định theo frame
+        for yy in range(0, self.h, 8):
+            cv2.line(viz_frame, (self.target_center_x, yy),
+                     (self.target_center_x, min(yy + 4, self.h)),
+                     COLOR_TARGET, 1)
+        # Dòng quét target X (ngang)
+        cv2.line(viz_frame, (self.target_left_x, self.target_x_scan_y),
+                 (self.target_right_x, self.target_x_scan_y),
+                 (0, 200, 200), 1, cv2.LINE_AA)
+
+        # ══════════════════════════════════════════════════
+        # BASELINE
+        # ══════════════════════════════════════════════════
         cv2.line(viz_frame, (0, self.y_bottom), (self.w, self.y_bottom), (255, 100, 255), 2)
 
-        # Tính độ cân bằng tại baseline
         if baseline_l_mid is not None and baseline_r_mid is not None:
-            dist_l = car_center_x - baseline_l_mid   # Khoảng cách vạch trái → tâm xe
-            dist_r = baseline_r_mid - car_center_x   # Khoảng cách tâm xe → vạch phải
+            dist_l = car_center_x - baseline_l_mid
+            dist_r = baseline_r_mid - car_center_x
             total = dist_l + dist_r if (dist_l + dist_r) > 0 else 1
-            self.baseline_balance = (dist_r - dist_l) / total  # -1=lệch phải, +1=lệch trái
+            self.baseline_balance = (dist_r - dist_l) / total
             bal_color = (0, 255, 0) if abs(self.baseline_balance) < 0.1 else (0, 165, 255)
             cv2.putText(viz_frame, f"BAL: {self.baseline_balance:+.2f}",
                         (10, self.y_bottom - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, bal_color, 2)
-            # Vẽ marker cân bằng tại baseline
             cv2.circle(viz_frame, (car_center_x, self.y_bottom), 5, (255, 100, 255), -1)
             if baseline_l_mid:
                 cv2.circle(viz_frame, (baseline_l_mid, self.y_bottom), 5, (0, 0, 255), -1)
@@ -225,20 +595,19 @@ class AdaptiveTrackerV2:
             cv2.putText(viz_frame, "BAL: N/A",
                         (10, self.y_bottom - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (128, 128, 128), 2)
 
-        # ==========================================
-        # BƯỚC 2: HỒI QUY XÁC ĐỊNH CẠNH CỦA ROI THANG
-        # ==========================================
+        # ══════════════════════════════════════════════════
+        # BƯỚC 2: Hồi quy xác định ROI hình thang
+        # ══════════════════════════════════════════════════
         poly_l, poly_r = None, None
-        
+
         if len(valid_l_pts) >= 3:
             y_coords, x_coords = zip(*valid_l_pts)
             poly_l = np.poly1d(np.polyfit(y_coords, x_coords, 1))
-            
+
         if len(valid_r_pts) >= 3:
             y_coords, x_coords = zip(*valid_r_pts)
             poly_r = np.poly1d(np.polyfit(y_coords, x_coords, 1))
 
-        # Cứu hộ ROI
         if poly_l is not None and poly_r is None:
             poly_r = np.poly1d([poly_l[1], poly_l[0] + self.standard_lane_width])
         elif poly_r is not None and poly_l is None:
@@ -251,70 +620,124 @@ class AdaptiveTrackerV2:
             target_l_top = poly_l(active_y_top)
             target_r_bot = poly_r(self.y_bottom)
             target_r_top = poly_r(active_y_top)
-            
-            new_target = np.array([target_l_bot, target_r_bot, target_l_top, target_r_top], dtype=np.float32)
 
+            new_target = np.array([target_l_bot, target_r_bot, target_l_top, target_r_top],
+                                  dtype=np.float32)
             if not self.roi_locked:
-                # ROI tự do → cập nhật EMA
-                self.roi_x = (self.roi_ema_alpha * new_target) + ((1 - self.roi_ema_alpha) * self.roi_x)
+                self.roi_x = (self.roi_ema_alpha * new_target) + \
+                             ((1 - self.roi_ema_alpha) * self.roi_x)
                 active_roi_x = self.roi_x.copy()
-            # Nếu locked, giữ nguyên active_roi_x
 
         curr_l_bot, curr_r_bot, curr_l_top, curr_r_top = map(int, active_roi_x)
 
-        # ==========================================
-        # BƯỚC 3: VẼ KHUNG ROI VÀ ĐƯỜNG ĐỊNH HƯỚNG
-        # ==========================================
+        # ══════════════════════════════════════════════════
+        # BƯỚC 3: Vẽ khung ROI + đường định hướng
+        # ══════════════════════════════════════════════════
         roi_color = (0, 200, 255) if self.roi_locked else (0, 0, 255)
-        trap_pts = np.array([[curr_l_bot, self.y_bottom], [curr_l_top, active_y_top], 
-                             [curr_r_top, active_y_top], [curr_r_bot, self.y_bottom]], np.int32)
+        trap_pts = np.array([
+            [curr_l_bot, self.y_bottom], [curr_l_top, active_y_top],
+            [curr_r_top, active_y_top], [curr_r_bot, self.y_bottom]
+        ], np.int32)
         cv2.polylines(viz_frame, [trap_pts], True, roi_color, 3)
 
-        # Nếu locked, vẽ nhãn LOCKED
         if self.roi_locked:
             cv2.putText(viz_frame, "ROI LOCKED", (self.w - 200, active_y_top - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
 
-        # Vẽ xương sống lượn sóng
         if len(center_path_pts) > 1:
             for i in range(len(center_path_pts) - 1):
-                cv2.line(viz_frame, center_path_pts[i], center_path_pts[i+1], COLOR_MID, 2)
-                
-        # Point of Orientation
+                cv2.line(viz_frame, center_path_pts[i], center_path_pts[i + 1], COLOR_MID, 2)
+
         mid_bot_x = (curr_l_bot + curr_r_bot) // 2
         mid_top_x = (curr_l_top + curr_r_top) // 2
-        
+
         cv2.line(viz_frame, (mid_top_x, active_y_top), (car_center_x, self.h), (0, 255, 255), 2)
         cv2.circle(viz_frame, (mid_top_x, active_y_top), 6, COLOR_CENTER, -1)
 
-        # ==========================================
-        # BƯỚC 4: PID CONTROLLER
-        # ==========================================
-        e_offset = (mid_bot_x - car_center_x) / (self.w / 2.0)
-        e_heading = (mid_top_x - mid_bot_x) / (self.w / 2.0)
+        # ══════════════════════════════════════════════════
+        # BƯỚC 4: CROSS-TRACK ERROR (CTE) + PID
+        # ══════════════════════════════════════════════════
+        actual_center_x = mid_bot_x
+        half_w = self.w / 2.0
+        cte = (actual_center_x - self.target_center_x) / half_w
 
-        # Tích phân (anti-windup clamp)
-        self._integral += e_offset
+        e_heading = (mid_top_x - mid_bot_x) / half_w
+
+        effective_Kp = self.Kp
+        if cte < 0:
+            effective_Kp = self.Kp * self.left_drift_boost
+
+        self._integral += cte
         self._integral = np.clip(self._integral, -self._integral_max, self._integral_max)
 
-        raw_steer = np.clip(
-            (self.Kp * e_offset) + (self.Ki * self._integral) + (self.Kd * e_heading),
-            -1.0, 1.0
-        )
+        d_cte = cte - self._prev_cte
+        self._prev_cte = cte
+
+        pid_steer = (effective_Kp * cte) + (self.Ki * self._integral) + (self.Kd * d_cte)
+
+        # ══════════════════════════════════════════════════
+        # BƯỚC 5: PURE PURSUIT (đường cong)
+        # ══════════════════════════════════════════════════
+        pursuit_steer = self._pure_pursuit_steer(center_path_pts,
+                                                  car_center_x, self.y_bottom)
+
+        if pursuit_steer is not None:
+            curvature_factor = min(abs(cte) * 3.0, 1.0)
+            blended = (1.0 - curvature_factor) * pid_steer + curvature_factor * pursuit_steer
+        else:
+            blended = pid_steer
+
+        raw_steer = np.clip(blended + self.drift_compensation, -1.0, 1.0)
         steer_final = self.steer_ema.update(raw_steer)
-        
-        # Hiển thị text
+
+        # ══════════════════════════════════════════════════
+        # VẼ CTE indicator
+        # ══════════════════════════════════════════════════
+        cte_color = (0, 255, 0) if abs(cte) < 0.05 else (0, 165, 255) if abs(cte) < 0.15 else (0, 0, 255)
+        cte_y = self.y_bottom - 20
+        cv2.arrowedLine(viz_frame,
+                        (self.target_center_x, cte_y),
+                        (actual_center_x, cte_y),
+                        cte_color, 3, tipLength=0.15)
+        cv2.putText(viz_frame, f"CTE:{cte:+.3f}",
+                    (self.target_center_x - 40, cte_y - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, cte_color, 1)
+
+        if pursuit_steer is not None and len(center_path_pts) >= 3:
+            la_dist = self.pursuit_lookahead_min + \
+                      (self.pursuit_lookahead_max - self.pursuit_lookahead_min) * 0.5
+            cv2.circle(viz_frame, (car_center_x, self.y_bottom),
+                       int(la_dist), (100, 255, 100), 1)
+
+        # ══════════════════════════════════════════════════
+        # HUD Text
+        # ══════════════════════════════════════════════════
         if self.roi_locked:
             status = "ROI LOCKED (intersection)"
+        elif self._intersection_confirm > 0:
+            status = f"DETECTING ({self._intersection_confirm}/{self._intersection_confirm_threshold})"
         elif is_tracking:
             status = "TRACKING"
         else:
             status = "PREDICTING"
-        cv2.putText(viz_frame, f"STEER: {steer_final:+.3f}", (150, 40), cv2.FONT_HERSHEY_DUPLEX, 1, (255, 255, 255), 2)
-        cv2.putText(viz_frame, status, (150, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, roi_color, 2)
-        cv2.putText(viz_frame, f"PID: P={e_offset:+.2f} I={self._integral:+.2f} D={e_heading:+.2f}",
-                    (10, self.h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
-            
+
+        cv2.putText(viz_frame, f"STEER: {steer_final:+.3f}", (150, 40),
+                    cv2.FONT_HERSHEY_DUPLEX, 1, (255, 255, 255), 2)
+        cv2.putText(viz_frame, status, (150, 70),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, roi_color, 2)
+
+        mode_txt = "PID+PP" if pursuit_steer is not None else "PID"
+        cv2.putText(viz_frame, f"Mode: {mode_txt}  CTE={cte:+.3f}  H={e_heading:+.2f}",
+                    (10, self.h - 35), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+        cv2.putText(viz_frame, f"PID: P={cte:+.2f} I={self._integral:+.2f} D={d_cte:+.2f}",
+                    (10, self.h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+
+        # ══════════════════════════════════════════════════
+        # BEV overlay — góc trên trái
+        # ══════════════════════════════════════════════════
+        bh, bw = bev_img.shape[:2]
+        viz_frame[5:5 + bh, 5:5 + bw] = bev_img
+
         return steer_final, viz_frame
 
 def main():
@@ -322,11 +745,13 @@ def main():
     tracker = AdaptiveTrackerV2()
     while True:
         ret, frame = cap.read()
-        if not ret: break
-        frame = cv2.resize(frame, (640, 480))
+        if not ret:
+            break
+        frame = cv2.resize(frame, (tracker.w, tracker.h))
         steer, viz = tracker.process_frame(frame)
         cv2.imshow("Adaptive ROI Track", viz)
-        if cv2.waitKey(1) & 0xFF == ord('q'): break
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
     cap.release()
     cv2.destroyAllWindows()
 

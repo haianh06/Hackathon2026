@@ -9,6 +9,7 @@ if command -v rpicam-vid &>/dev/null; then
     rpicam-vid --codec mjpeg -t 0 --nopreview \
         --mode 1640:1232 \
         --width 640 --height 480 --framerate 15 \
+        --rotation 180 \
         --roi 0,0,1,1 \
         --listen -o tcp://0.0.0.0:8554 &
         
