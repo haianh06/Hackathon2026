@@ -8,7 +8,6 @@ import {
 } from '@heroicons/react/24/outline';
 
 const STREAM_URLS = {
-    unet: '/camera/lane/stream',
     canny: '/camera/processed/stream?mode=canny',
     all: '/camera/processed/stream?mode=all',
 };
@@ -33,7 +32,7 @@ function MapPage() {
     const [debug, setDebug] = useState(null);
     const [debugPolling, setDebugPolling] = useState(false);
     const [debugHistory, setDebugHistory] = useState([]);
-    const [debugStreamMode, setDebugStreamMode] = useState('unet');
+    const [debugStreamMode, setDebugStreamMode] = useState('canny');
     const debugIntervalRef = useRef(null);
 
     // ── Load map data ──
@@ -248,10 +247,10 @@ function MapPage() {
                             <div className="flex items-center justify-between px-4 py-2.5 border-b bg-gray-50">
                                 <div className="flex items-center gap-2">
                                     <span className="text-sm font-semibold text-gray-600">
-                                        {debugStreamMode === 'canny' ? 'Canny Edge' : debugStreamMode === 'all' ? 'Canny + UNet' : 'UNet Lane'}
+                                        {debugStreamMode === 'canny' ? 'Canny Edge' : 'Canny + Sign'}
                                     </span>
                                     <div className="flex rounded-lg overflow-hidden border border-gray-300">
-                                        {[['unet', 'UNet'], ['canny', 'Canny'], ['all', 'All']].map(([mode, label]) => (
+                                        {[['canny', 'Canny'], ['all', 'All']].map(([mode, label]) => (
                                             <button key={mode} onClick={() => setDebugStreamMode(mode)}
                                                 className={`px-2 py-1 text-xs font-medium ${debugStreamMode === mode ? 'bg-blue-600 text-white' : 'bg-white text-gray-600 hover:bg-gray-100'}`}>
                                                 {label}

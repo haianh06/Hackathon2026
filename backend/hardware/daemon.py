@@ -371,10 +371,19 @@ class HardwareDaemon:
             self._calibrate_running = True
             asyncio.ensure_future(self._run_deadband_test(data))
 
-        try:
-            await self.sio.connect(self.server_url)
-        except Exception as e:
-            logger.error(f"Failed to connect to server: {e}")
+        # Retry loop: backend may not be ready when hardware daemon starts
+        max_retries = 30
+        for attempt in range(1, max_retries + 1):
+            try:
+                await self.sio.connect(self.server_url)
+                logger.info(f"✅ Socket.IO connected to {self.server_url}")
+                break
+            except Exception as e:
+                logger.warning(f"Socket.IO connect attempt {attempt}/{max_retries}: {e}")
+                if attempt < max_retries:
+                    await asyncio.sleep(2)
+                else:
+                    logger.error(f"❌ Failed to connect to server after {max_retries} attempts")
 
     async def report_status(self):
         """Report full hardware status to server"""
@@ -408,7 +417,7 @@ class HardwareDaemon:
         and only add drift-bias compensation for mechanical offset.
 
           1. Start driving forward
-          2. Every ~80ms: grab frame → target X + canny + UNet → get steer → adjust motor
+          2. Every ~80ms: grab frame → target X + canny → get steer → adjust motor
           3. Stop after step_duration
         """
         import time as _time
@@ -417,8 +426,7 @@ class HardwareDaemon:
         # Configurable parameters
         step_duration = data.get('duration', 0.8)
         speed = data.get('speed', 40)
-        LOOP_INTERVAL = 0.08          # 80ms → ~12.5 Hz servo update rate
-        DEAD_ZONE = 0.04              # Ignore tiny corrections
+        LOOP_INTERVAL = 0.05          # 50ms → ~20 Hz servo update (every servo cycle)
 
         try:
 
@@ -426,8 +434,9 @@ class HardwareDaemon:
             if self.line_follower and hasattr(self.line_follower, 'reset'):
                 self.line_follower.reset()
 
-            # Start driving
-            self.motor.forward(speed)
+            # Start with forward_steer(0) — continuous steering from tick 0
+            # Never call motor.forward() in the loop — always forward_steer()
+            self.motor.forward_steer(0.0)
             start_time = _time.time()
             last_steer = 0.0
             frames_ok = 0
@@ -435,7 +444,7 @@ class HardwareDaemon:
             while (_time.time() - start_time) < step_duration:
                 loop_start = _time.time()
 
-                # ── Grab frame → 3-tier steering (target X → canny → UNet) ──
+                # ── Grab frame → 2-tier steering (target X → canny) ──
                 lane_steer = 0.0
 
                 frame_bytes = await self.camera.get_latest_frame()
@@ -446,30 +455,12 @@ class HardwareDaemon:
                     except Exception as e:
                         logger.debug(f"Step loop detect error: {e}")
 
-                error = lane_steer
-
-                # ── Drift bias (long-term mechanical offset) ──
-                self._drift_ema = self._drift_alpha * error + (1 - self._drift_alpha) * self._drift_ema
-                if len(self._drift_history) >= 5:
-                    recent = [s for s, _ in self._drift_history[-15:]]
-                    drift_mean = np.mean(recent)
-                    drift_std = np.std(recent) if len(recent) > 1 else 1.0
-                    if drift_std < 0.25 and abs(drift_mean) > 0.04:
-                        self._drift_bias = -0.25 * drift_mean
-
-                # ── Final steer: lane output + drift bias ──
-                final_steer = max(-1.0, min(1.0, lane_steer + self._drift_bias))
-
-                # ── Apply to motor ──
-                if abs(final_steer) > DEAD_ZONE:
-                    self.motor.forward_steer(final_steer)
-                else:
-                    self.motor.forward(speed)
-
-                self._prev_steer = error
-                self._drift_history.append((error, LOOP_INTERVAL))
-                if len(self._drift_history) > 60:
-                    self._drift_history = self._drift_history[-40:]
+                # ── Apply single-servo steering EVERY tick ──
+                # Vision PID already outputs the correct correction.
+                # Do NOT add drift bias — it creates a positive feedback
+                # loop that fights the PID and flips the steering sign.
+                final_steer = max(-1.0, min(1.0, lane_steer))
+                self.motor.forward_steer(final_steer)
                 last_steer = lane_steer
 
                 # Sleep remainder of loop interval
@@ -487,7 +478,7 @@ class HardwareDaemon:
 
             logger.info(
                 f"MAP-STEP: final_steer={final_steer:+.3f} "
-                f"frames_ok={frames_ok} drift_bias={self._drift_bias:+.3f}"
+                f"frames_ok={frames_ok}"
             )
 
             # Report position
@@ -500,7 +491,6 @@ class HardwareDaemon:
                     'stepCount': self._map_step_count,
                     'steering': final_steer,
                     'framesOk': frames_ok,
-                    'driftBias': self._drift_bias,
                     'timestamp': _time.time(),
                 })
 
@@ -511,11 +501,6 @@ class HardwareDaemon:
     async def _map_build_turn(self, direction):
         """Turn 90 degrees left or right, update direction."""
         import time as _time
-
-        # Unlock canny ROI — car is leaving the intersection onto a new lane
-        if CANNY_AVAILABLE and self._lane_tracker is not None:
-            self._lane_tracker.unlock_roi()
-            logger.info("  🔓 Canny ROI unlocked for map-build turn")
 
         try:
             turn_duration = 2.0  # Doubled for full 90-degree rotation
@@ -583,18 +568,7 @@ class HardwareDaemon:
             logger.error(f"Lane analysis error: {e}")
             return None
 
-    async def _get_unet_correction(self):
-        """Get steering correction from UNet line follower model."""
-        if self.line_follower is None or not self.line_follower.is_ready:
-            return 0.0
-        try:
-            frame_bytes = await self.camera.get_latest_frame()
-            if frame_bytes is None:
-                return 0.0
-            return self.line_follower.analyse_frame(frame_bytes)
-        except Exception as e:
-            logger.debug(f"UNet correction error: {e}")
-            return 0.0
+
 
     # ====== Motor Calibration Methods ======
     async def _run_sweep_test(self, data):
@@ -1059,7 +1033,7 @@ class HardwareDaemon:
 
         # ── Unified processed stream (mode via query param) ──
         async def handle_processed_stream(request):
-            """MJPEG stream with switchable processing: raw|canny|unet|all."""
+            """MJPEG stream with switchable processing: raw|canny|all."""
             mode = request.query.get('mode', 'raw')
 
             # Only import cv2 when a processing mode actually needs it
@@ -1078,8 +1052,8 @@ class HardwareDaemon:
                     logger.warning("cv2 not available for mode=sign")
 
             sleep_map = {
-                'raw': 0.03, 'canny': 0.07, 'unet': 0.10,
-                'all': 0.15, 'sign': 0.05,
+                'raw': 0.03, 'canny': 0.07,
+                'all': 0.10, 'sign': 0.05,
             }
             sleep_time = sleep_map.get(mode, 0.1)
 
@@ -1114,12 +1088,6 @@ class HardwareDaemon:
                                         '.jpg', vis,
                                         [_cv2.IMWRITE_JPEG_QUALITY, 90])
                                     jpeg = enc.tobytes()
-
-                        elif mode == 'unet':
-                            if self.line_follower.is_ready:
-                                debug = self.line_follower.analyse_frame_debug(
-                                    frame_bytes)
-                                jpeg = debug.get('mask_jpeg') or frame_bytes
 
                         elif mode == 'sign' and _cv2:
                             nparr = np.frombuffer(frame_bytes, np.uint8)
@@ -1178,38 +1146,17 @@ class HardwareDaemon:
                             if bgr is not None:
                                 bgr = _cv2.resize(bgr, (640, 480))
 
-                                # Re-encode at 640x480 for consistent coords
-                                _, resized_enc = _cv2.imencode(
-                                    '.jpg', bgr,
-                                    [_cv2.IMWRITE_JPEG_QUALITY, 85])
-                                resized_bytes = resized_enc.tobytes()
-
-                                # 1) Canny lane overlay → base visualization
+                                # Canny lane overlay → base visualization
                                 if CANNY_AVAILABLE and self._lane_tracker:
                                     _, vis = self._lane_tracker.process_frame(
                                         bgr)
                                 else:
                                     vis = bgr.copy()
 
-                                # 2) UNet correction overlay text
-                                if self.line_follower.is_ready:
-                                    dbg = \
-                                        self.line_follower.analyse_frame_debug(
-                                            resized_bytes)
-                                    corr = dbg.get('correction', 0.0)
-                                    conf = dbg.get('confidence', 0.0)
-                                    _cv2.putText(
-                                        vis,
-                                        f"UNet corr={corr:.3f} "
-                                        f"conf={conf:.1%}",
-                                        (15, 25),
-                                        _cv2.FONT_HERSHEY_SIMPLEX,
-                                        0.6, (0, 255, 255), 2)
-
-                                # 4) Mode label
+                                # Mode label
                                 h = vis.shape[0]
                                 _cv2.putText(
-                                    vis, "[ALL] Canny + UNet",
+                                    vis, "[ALL] Canny Lane Detection",
                                     (15, h - 15),
                                     _cv2.FONT_HERSHEY_SIMPLEX,
                                     0.5, (255, 255, 0), 1)

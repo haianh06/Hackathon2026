@@ -20,18 +20,18 @@ import React, { useRef, useEffect, useState, useCallback } from 'react';
  *   White blocks [bld] are buildings.
  */
 
-// Buildings (white rounded-rect areas)
+// Buildings (white rounded-rect areas) — coordinates in map space (4x scaled)
 const OBSTACLES = [
     // Large top building with purple border (destination B area)
-    { x: 110, y: 80, w: 380, h: 125, purpleBorder: true },
+    { x: 440, y: 320, w: 1520, h: 500, purpleBorder: true },
     // Middle-left building (between Row 1 and Row 2)
-    { x: 100, y: 270, w: 145, h: 115 },
+    { x: 400, y: 1080, w: 580, h: 460 },
     // Middle-right building (between Row 1 and Row 2)
-    { x: 355, y: 270, w: 145, h: 115 },
+    { x: 1420, y: 1080, w: 580, h: 460 },
     // Bottom-left building (between Row 2 and Row 3)
-    { x: 100, y: 455, w: 145, h: 130 },
+    { x: 400, y: 1820, w: 580, h: 520 },
     // Bottom-right building (between Row 2 and Row 3)
-    { x: 355, y: 455, w: 145, h: 130 },
+    { x: 1420, y: 1820, w: 580, h: 520 },
 ];
 
 const POINT_COLORS = {
@@ -46,6 +46,7 @@ const POINT_COLORS = {
 function DemoMap({ points, vehiclePosition, activePath, livePos }) {
     const canvasRef = useRef(null);
     const [hoveredPoint, setHoveredPoint] = useState(null);
+    const transformRef = useRef({ offX: 0, offY: 0, mapScale: 1, minX: 0, minY: 0 });
 
     const drawMap = useCallback(() => {
         const canvas = canvasRef.current;
@@ -58,21 +59,46 @@ function DemoMap({ points, vehiclePosition, activePath, livePos }) {
         ctx.fillStyle = '#8e8e8e';
         ctx.fillRect(0, 0, W, H);
 
+        // ── Auto-fit: map coordinates → canvas pixels ──
+        // Compute bounding box of all map content
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        if (points && points.length > 0) {
+            points.forEach(p => {
+                minX = Math.min(minX, p.x); minY = Math.min(minY, p.y);
+                maxX = Math.max(maxX, p.x); maxY = Math.max(maxY, p.y);
+            });
+        }
+        OBSTACLES.forEach(o => {
+            minX = Math.min(minX, o.x); minY = Math.min(minY, o.y);
+            maxX = Math.max(maxX, o.x + o.w); maxY = Math.max(maxY, o.y + o.h);
+        });
+        const PAD = 40; // padding in canvas pixels
+        const mapW = (maxX - minX) || 1;
+        const mapH = (maxY - minY) || 1;
+        const mapScale = Math.min((W - PAD * 2) / mapW, (H - PAD * 2) / mapH);
+        const offX = PAD + ((W - PAD * 2) - mapW * mapScale) / 2;
+        const offY = PAD + ((H - PAD * 2) - mapH * mapScale) / 2;
+        // Helper: map coords → canvas coords
+        const tx = (x) => offX + (x - minX) * mapScale;
+        const ty = (y) => offY + (y - minY) * mapScale;
+        const ts = (size) => size * mapScale; // scale a size/dimension
+        transformRef.current = { offX, offY, mapScale, minX, minY };
+
         // ── 2. Buildings (white rounded rectangles) ──
         OBSTACLES.forEach(obs => {
             ctx.fillStyle = 'rgba(0,0,0,0.12)';
             ctx.beginPath();
-            ctx.roundRect(obs.x + 3, obs.y + 3, obs.w, obs.h, 14);
+            ctx.roundRect(tx(obs.x) + 3, ty(obs.y) + 3, ts(obs.w), ts(obs.h), 14);
             ctx.fill();
             ctx.fillStyle = '#ffffff';
             ctx.beginPath();
-            ctx.roundRect(obs.x, obs.y, obs.w, obs.h, 14);
+            ctx.roundRect(tx(obs.x), ty(obs.y), ts(obs.w), ts(obs.h), 14);
             ctx.fill();
             if (obs.purpleBorder) {
                 ctx.strokeStyle = '#9b51e0';
                 ctx.lineWidth = 3.5;
                 ctx.beginPath();
-                ctx.roundRect(obs.x, obs.y, obs.w, obs.h, 14);
+                ctx.roundRect(tx(obs.x), ty(obs.y), ts(obs.w), ts(obs.h), 14);
                 ctx.stroke();
             }
         });
@@ -104,8 +130,8 @@ function DemoMap({ points, vehiclePosition, activePath, livePos }) {
                 ctx.lineCap = 'round';
                 ctx.setLineDash([]);
                 ctx.beginPath();
-                ctx.moveTo(point.x, point.y);
-                ctx.lineTo(t.x, t.y);
+                ctx.moveTo(tx(point.x), ty(point.y));
+                ctx.lineTo(tx(t.x), ty(t.y));
                 ctx.stroke();
                 // Dashed center line
                 ctx.strokeStyle = 'rgba(255,255,255,0.5)';
@@ -113,8 +139,8 @@ function DemoMap({ points, vehiclePosition, activePath, livePos }) {
                 ctx.setLineDash([14, 10]);
                 ctx.lineCap = 'butt';
                 ctx.beginPath();
-                ctx.moveTo(point.x, point.y);
-                ctx.lineTo(t.x, t.y);
+                ctx.moveTo(tx(point.x), ty(point.y));
+                ctx.lineTo(tx(t.x), ty(t.y));
                 ctx.stroke();
                 ctx.setLineDash([]);
             });
@@ -128,8 +154,8 @@ function DemoMap({ points, vehiclePosition, activePath, livePos }) {
             ctx.lineCap = 'round';
             ctx.lineJoin = 'round';
             ctx.beginPath();
-            ctx.moveTo(activePath[0].x, activePath[0].y);
-            for (let i = 1; i < activePath.length; i++) ctx.lineTo(activePath[i].x, activePath[i].y);
+            ctx.moveTo(tx(activePath[0].x), ty(activePath[0].y));
+            for (let i = 1; i < activePath.length; i++) ctx.lineTo(tx(activePath[i].x), ty(activePath[i].y));
             ctx.stroke();
 
             // Path line
@@ -137,16 +163,16 @@ function DemoMap({ points, vehiclePosition, activePath, livePos }) {
             ctx.lineWidth = 5;
             ctx.setLineDash([10, 5]);
             ctx.beginPath();
-            ctx.moveTo(activePath[0].x, activePath[0].y);
-            for (let i = 1; i < activePath.length; i++) ctx.lineTo(activePath[i].x, activePath[i].y);
+            ctx.moveTo(tx(activePath[0].x), ty(activePath[0].y));
+            for (let i = 1; i < activePath.length; i++) ctx.lineTo(tx(activePath[i].x), ty(activePath[i].y));
             ctx.stroke();
             ctx.setLineDash([]);
 
             // Direction arrows
             for (let i = 0; i < activePath.length - 1; i++) {
                 const p1 = activePath[i], p2 = activePath[i + 1];
-                const ax = (p1.x + p2.x) / 2, ay = (p1.y + p2.y) / 2;
-                const angle = Math.atan2(p2.y - p1.y, p2.x - p1.x);
+                const ax = (tx(p1.x) + tx(p2.x)) / 2, ay = (ty(p1.y) + ty(p2.y)) / 2;
+                const angle = Math.atan2(ty(p2.y) - ty(p1.y), tx(p2.x) - tx(p1.x));
                 ctx.save();
                 ctx.translate(ax, ay);
                 ctx.rotate(angle);
@@ -186,11 +212,11 @@ function DemoMap({ points, vehiclePosition, activePath, livePos }) {
             const r = (isStart || isStop || isDest) ? 16 : 10;
 
             // Shadow
-            ctx.beginPath(); ctx.arc(point.x + 1, point.y + 1, r, 0, Math.PI * 2);
+            ctx.beginPath(); ctx.arc(tx(point.x) + 1, ty(point.y) + 1, r, 0, Math.PI * 2);
             ctx.fillStyle = 'rgba(0,0,0,0.2)'; ctx.fill();
 
             // Circle
-            ctx.beginPath(); ctx.arc(point.x, point.y, r, 0, Math.PI * 2);
+            ctx.beginPath(); ctx.arc(tx(point.x), ty(point.y), r, 0, Math.PI * 2);
             ctx.fillStyle = color; ctx.fill();
             ctx.strokeStyle = '#fff'; ctx.lineWidth = 3; ctx.stroke();
 
@@ -198,7 +224,7 @@ function DemoMap({ points, vehiclePosition, activePath, livePos }) {
             ctx.fillStyle = '#fff';
             ctx.font = `bold ${(isStart || isStop) ? 9 : isDest ? 12 : 9}px "Segoe UI", sans-serif`;
             ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-            ctx.fillText(isStart ? 'Start' : isStop ? 'Stop' : point.pointId, point.x, point.y);
+            ctx.fillText(isStart ? 'Start' : isStop ? 'Stop' : point.pointId, tx(point.x), ty(point.y));
             ctx.textBaseline = 'alphabetic';
 
             // Label below
@@ -206,35 +232,35 @@ function DemoMap({ points, vehiclePosition, activePath, livePos }) {
                 ctx.font = 'bold 11px "Segoe UI", sans-serif';
                 const lbl = point.label;
                 const lblW = ctx.measureText(lbl).width + 8;
-                const ly = point.y + r + 14;
+                const ly = ty(point.y) + r + 14;
                 ctx.fillStyle = 'rgba(255,255,255,0.92)';
-                ctx.beginPath(); ctx.roundRect(point.x - lblW / 2, ly - 10, lblW, 15, 4); ctx.fill();
+                ctx.beginPath(); ctx.roundRect(tx(point.x) - lblW / 2, ly - 10, lblW, 15, 4); ctx.fill();
                 ctx.fillStyle = '#333'; ctx.textAlign = 'center';
-                ctx.fillText(lbl, point.x, ly);
+                ctx.fillText(lbl, tx(point.x), ly);
             }
         });
 
         // ── Live vehicle position (interpolated) ──
         if (livePos && livePos.x != null && livePos.y != null) {
             ctx.beginPath();
-            ctx.arc(livePos.x, livePos.y, 26, 0, Math.PI * 2);
+            ctx.arc(tx(livePos.x), ty(livePos.y), 26, 0, Math.PI * 2);
             ctx.fillStyle = 'rgba(66,133,244,0.25)';
             ctx.fill();
             ctx.font = '22px serif';
             ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-            ctx.fillText('\ud83d\ude97', livePos.x, livePos.y);
+            ctx.fillText('\ud83d\ude97', tx(livePos.x), ty(livePos.y));
             ctx.textBaseline = 'alphabetic';
         } else if (vehiclePosition) {
             // Fallback: show car at waypoint
             const vp = pointMap[vehiclePosition];
             if (vp) {
                 ctx.beginPath();
-                ctx.arc(vp.x, vp.y, 26, 0, Math.PI * 2);
+                ctx.arc(tx(vp.x), ty(vp.y), 26, 0, Math.PI * 2);
                 ctx.fillStyle = 'rgba(66,133,244,0.25)';
                 ctx.fill();
                 ctx.font = '22px serif';
                 ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-                ctx.fillText('\ud83d\ude97', vp.x, vp.y);
+                ctx.fillText('\ud83d\ude97', tx(vp.x), ty(vp.y));
                 ctx.textBaseline = 'alphabetic';
             }
         }
@@ -253,9 +279,12 @@ function DemoMap({ points, vehiclePosition, activePath, livePos }) {
         const sy = canvas.height / rect.height;
         const mx = (e.clientX - rect.left) * sx;
         const my = (e.clientY - rect.top) * sy;
+        const { offX: tOffX, offY: tOffY, mapScale: tScale, minX: tMinX, minY: tMinY } = transformRef.current;
+        const htx = (x) => tOffX + (x - tMinX) * tScale;
+        const hty = (y) => tOffY + (y - tMinY) * tScale;
         let found = null;
         for (const p of points) {
-            if ((p.x - mx) ** 2 + (p.y - my) ** 2 < 600) { found = p; break; }
+            if ((htx(p.x) - mx) ** 2 + (hty(p.y) - my) ** 2 < 600) { found = p; break; }
         }
         setHoveredPoint(found);
     };

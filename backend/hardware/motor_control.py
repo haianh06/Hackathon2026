@@ -9,11 +9,14 @@ Requires dtoverlay=pwm-2chan,pin=12,func=4,pin2=13,func2=4 in
 
 Vehicle has 2 continuous-rotation servo motors controlled by PWM.
 Each motor has its own neutral point and drive offset (asymmetric).
+Servos are mirror-mounted: opposite pulse directions = same wheel direction.
 
-  - Forward:  Both motors pulse > their neutral
-  - Backward: Both motors pulse < their neutral
-  - Turn Left:  Left backward, Right forward (pivot)
-  - Turn Right: Left forward, Right backward (pivot)
+  - Left motor:  pulse < neutral = FORWARD,  pulse > neutral = BACKWARD
+  - Right motor: pulse > neutral = FORWARD,  pulse < neutral = BACKWARD
+  - Forward:  left=neutral-offset, right=neutral+offset
+  - Backward: left=neutral+offset, right=neutral-offset
+  - Turn Left:  left backward (neutral+offset), right forward (neutral+offset)
+  - Turn Right: left forward (neutral-offset), right backward (neutral-offset)
   - Stop:     PWM disabled on both channels
 
 All PWM parameters are loaded from environment variables for easy
@@ -42,12 +45,12 @@ except ImportError:
 
 # ─── PWM Servo Constants (from environment variables) ───
 # dtoverlay=pwm-2chan,pin=12,func=4,pin2=13,func2=4
-# GPIO 12 → PWM chip 2, channel 0
-# GPIO 13 → PWM chip 2, channel 2
-LEFT_PWM_CHIP  = int(os.environ.get('MOTOR_LEFT_PWM_CHIP', 2))
+# GPIO 12 → PWM chip 0, channel 0
+# GPIO 13 → PWM chip 0, channel 1
+LEFT_PWM_CHIP  = int(os.environ.get('MOTOR_LEFT_PWM_CHIP', 0))
 LEFT_PWM_CHAN  = int(os.environ.get('MOTOR_LEFT_PWM_CHANNEL', 0))
-RIGHT_PWM_CHIP = int(os.environ.get('MOTOR_RIGHT_PWM_CHIP', 2))
-RIGHT_PWM_CHAN = int(os.environ.get('MOTOR_RIGHT_PWM_CHANNEL', 2))
+RIGHT_PWM_CHIP = int(os.environ.get('MOTOR_RIGHT_PWM_CHIP', 0))
+RIGHT_PWM_CHAN = int(os.environ.get('MOTOR_RIGHT_PWM_CHANNEL', 1))
 PWM_FREQ       = int(os.environ.get('MOTOR_PWM_FREQ', 50))
 
 # Legacy pin numbers (kept for status reporting / calibration UI)
@@ -74,9 +77,25 @@ LEFT_MIRROR = os.environ.get('MOTOR_LEFT_MIRROR', '0') == '1'
 # Drift bias
 DRIFT_BIAS = float(os.environ.get('MOTOR_DRIFT_BIAS', '0.0'))
 
+# Steering inversion: set to 1 to swap which servo drives for +/- correction
+STEER_INVERT = os.environ.get('MOTOR_STEER_INVERT', '0') == '1'
+
 # ─── PWM Ramp Constants ───
 RAMP_STEP_US = int(os.environ.get('MOTOR_RAMP_STEP_US', 10))
 RAMP_STEP_MS = int(os.environ.get('MOTOR_RAMP_STEP_MS', 10))
+
+# ─── Deadband: suppress PWM near neutral to prevent buzz/creep ───
+# If |pulse - neutral| < DEADBAND_US → force PWM OFF entirely
+DEADBAND_US = int(os.environ.get('MOTOR_DEADBAND_US', 15))
+
+# ─── EMA (Exponential Moving Average) filter for PWM noise reduction ───
+# Lower alpha = more smoothing (slower response), higher = less smoothing
+# 0.3 is a good balance: filters spikes without adding noticeable lag
+EMA_ALPHA = float(os.environ.get('MOTOR_EMA_ALPHA', '0.3'))
+
+# ─── Force-stop: number of retries to ensure PWM is truly killed ───
+STOP_RETRIES = int(os.environ.get('MOTOR_STOP_RETRIES', 3))
+STOP_RETRY_MS = int(os.environ.get('MOTOR_STOP_RETRY_MS', 20))
 
 
 class MockMotorController:
@@ -122,8 +141,8 @@ class HardwarePWMController:
     Uses rpi-hardware-pwm for rock-solid, jitter-free PWM output.
     
     dtoverlay=pwm-2chan,pin=12,func=4,pin2=13,func2=4
-      GPIO 12 → pwmchip2/pwm0  (left motor)
-      GPIO 13 → pwmchip2/pwm2  (right motor)
+      GPIO 12 → pwmchip0/pwm0  (left motor)
+      GPIO 13 → pwmchip0/pwm1  (right motor)
     """
     def __init__(self, config):
         motor_cfg = config.get('motor', {})
@@ -149,6 +168,10 @@ class HardwarePWMController:
         self._current_right_us = self.right_neutral
         self._ramp_cancel = threading.Event()
         self._ramp_thread = None
+
+        # EMA filter state (tracks smoothed pulse values)
+        self._ema_left_us = float(self.left_neutral)
+        self._ema_right_us = float(self.right_neutral)
 
         # Hardware PWM instances
         self._left_pwm = None
@@ -180,41 +203,109 @@ class HardwarePWMController:
             logger.error(f"❌ Hardware PWM init failed: {e}")
             self._hw_ready = False
 
+    def _apply_deadband(self, pulse_us, neutral):
+        """If pulse is within deadband of neutral, return 0 (stop).
+        Prevents servo buzz/creep from tiny PWM offsets near neutral."""
+        if abs(pulse_us - neutral) < DEADBAND_US:
+            return 0
+        return pulse_us
+
+    def _ema_filter(self, target_us, prev_ema, alpha=None):
+        """Exponential Moving Average filter.
+        Smooths sudden PWM spikes before reaching the servo.
+        Returns: new EMA value (float)."""
+        if alpha is None:
+            alpha = EMA_ALPHA
+        return alpha * target_us + (1.0 - alpha) * prev_ema
+
     def _set_pwm(self, channel, pulse_us):
         """Set PWM pulse width in microseconds on a channel.
-        channel: 'left' or 'right' (or the HardwarePWM instance).
-        pulse_us=0 → disable PWM on that channel."""
+        channel: 'left' or 'right'.
+        pulse_us=0 → disable PWM on that channel.
+        Applies deadband check (skip EMA for single-channel direct set)."""
         pwm_obj = self._left_pwm if channel == 'left' else self._right_pwm
+        neutral = self.left_neutral if channel == 'left' else self.right_neutral
         if pwm_obj is None:
             return
         try:
+            # Deadband: force off if too close to neutral
+            if pulse_us != 0:
+                pulse_us = self._apply_deadband(pulse_us, neutral)
+
             if pulse_us == 0:
                 pwm_obj.stop()
+                if channel == 'left':
+                    self._pwm_active = False  # will be reassessed
+                return
+
+            duty = (pulse_us / 20000.0) * 100.0  # µs → duty cycle %
+            if not self._pwm_active:
+                pwm_obj.start(duty)
             else:
-                duty = (pulse_us / 20000.0) * 100.0  # µs → duty cycle %
-                if not self._pwm_active:
-                    pwm_obj.start(duty)
-                else:
-                    pwm_obj.change_duty_cycle(duty)
+                pwm_obj.change_duty_cycle(duty)
         except Exception as e:
             logger.error(f"HW PWM error ({channel}): {e}")
 
     def _set_both_pwm(self, left_us, right_us):
-        """Set PWM on both channels simultaneously."""
+        """Set PWM on both channels with deadband enforcement.
+        Values within deadband of neutral → that channel is stopped."""
         if not self._hw_ready:
             return
-        left_duty = (left_us / 20000.0) * 100.0
-        right_duty = (right_us / 20000.0) * 100.0
+
+        # Apply deadband independently per channel
+        left_db = self._apply_deadband(left_us, self.left_neutral)
+        right_db = self._apply_deadband(right_us, self.right_neutral)
+
         try:
+            if left_db == 0 and right_db == 0:
+                # Both in deadband → stop both
+                self._force_stop_pwm()
+                return
+
             if not self._pwm_active:
-                self._left_pwm.start(left_duty)
-                self._right_pwm.start(right_duty)
+                # Starting from stopped: use actual values (or neutral for deadband channels)
+                l_start = left_db if left_db != 0 else self.left_neutral
+                r_start = right_db if right_db != 0 else self.right_neutral
+                self._left_pwm.start((l_start / 20000.0) * 100.0)
+                self._right_pwm.start((r_start / 20000.0) * 100.0)
                 self._pwm_active = True
             else:
-                self._left_pwm.change_duty_cycle(left_duty)
-                self._right_pwm.change_duty_cycle(right_duty)
+                # Active channels: update duty cycle
+                # Deadband channels: FORCE to neutral (do NOT skip!)
+                # Skipping leaves the old duty running → servo never stops.
+                l_duty = (left_db / 20000.0) * 100.0 if left_db != 0 \
+                    else (self.left_neutral / 20000.0) * 100.0
+                r_duty = (right_db / 20000.0) * 100.0 if right_db != 0 \
+                    else (self.right_neutral / 20000.0) * 100.0
+                self._left_pwm.change_duty_cycle(l_duty)
+                self._right_pwm.change_duty_cycle(r_duty)
         except Exception as e:
             logger.error(f"HW PWM set_both error: {e}")
+
+    def _ema_set_both(self, left_target_us, right_target_us):
+        """Apply EMA filter + deadband, then set PWM on both channels.
+        Used for high-frequency paths (forward_steer) to smooth jitter.
+
+        CRITICAL: When a channel targets neutral (stop), snap EMA
+        immediately instead of slowly transitioning.  This prevents
+        the "stopped" servo from running forward for 8+ frames due
+        to EMA lag."""
+        # Snap to neutral instantly when target is within deadband
+        if abs(left_target_us - self.left_neutral) < DEADBAND_US:
+            self._ema_left_us = float(self.left_neutral)
+        else:
+            self._ema_left_us = self._ema_filter(left_target_us, self._ema_left_us)
+
+        if abs(right_target_us - self.right_neutral) < DEADBAND_US:
+            self._ema_right_us = float(self.right_neutral)
+        else:
+            self._ema_right_us = self._ema_filter(right_target_us, self._ema_right_us)
+
+        filtered_left = int(round(self._ema_left_us))
+        filtered_right = int(round(self._ema_right_us))
+        self._set_both_pwm(filtered_left, filtered_right)
+        self._current_left_us = filtered_left
+        self._current_right_us = filtered_right
 
     def _ensure_pwm_at_neutral(self):
         """Start PWM at neutral if currently stopped."""
@@ -303,75 +394,121 @@ class HardwarePWMController:
         logger.info("Backward: ramping to drive speed")
 
     def turn_left(self, speed=50):
-        """Pivot left."""
+        """Pivot left: left wheel backward, right wheel forward."""
         self.status = 'turning_left'
         self._ramp_to(
-            self.left_neutral - self.left_turn_offset,
-            self.right_neutral - self.right_turn_offset,
+            self.left_neutral + self.left_turn_offset,    # left backward (above neutral)
+            self.right_neutral + self.right_turn_offset,  # right forward (above neutral)
         )
         logger.info("Turn Left: ramping (pivot)")
 
     def turn_right(self, speed=50):
-        """Pivot right."""
+        """Pivot right: left wheel forward, right wheel backward."""
         self.status = 'turning_right'
         self._ramp_to(
-            self.left_neutral + self.left_turn_offset,
-            self.right_neutral + self.right_turn_offset,
+            self.left_neutral - self.left_turn_offset,    # left forward (below neutral)
+            self.right_neutral - self.right_turn_offset,  # right backward (below neutral)
         )
         logger.info("Turn Right: ramping (pivot)")
 
     def forward_steer(self, correction, speed_factor=1.0):
         """
-        Drive forward with differential steering.
+        Drive forward with SINGLE-SERVO steering.
+
+        Only ONE servo drives to pull the nose back toward the lane center.
+        The other servo stays at neutral (stopped). This prevents uneven
+        dual-servo speeds from dragging the car further off-course.
+
         correction in [-1.0 … +1.0]:
-          negative → steer LEFT, positive → steer RIGHT
+          positive → car drifted LEFT  → need to steer RIGHT
+          negative → car drifted RIGHT → need to steer LEFT
+          ~0       → both servos drive forward (straight)
+
+        Which servo drives depends on MOTOR_STEER_INVERT:
+         - Default (0): positive → LEFT servo forward → nose RIGHT
+         - Inverted (1): positive → RIGHT servo forward → nose RIGHT
+        Use MOTOR_STEER_INVERT=1 if the car steers the wrong way.
+
+        Mirror-mounted servos:
+          Left (GPIO12):  forward = neutral - offset  (below neutral)
+          Right (GPIO13): forward = neutral + offset  (above neutral)
         """
         corrected = correction + self.drift_bias
         corrected = max(-1.0, min(1.0, corrected))
 
-        left_max_steer = self.left_drive_offset * 0.65
-        right_max_steer = self.right_drive_offset * 0.65
+        # Apply steering inversion if configured
+        if STEER_INVERT:
+            corrected = -corrected
 
         abs_c = min(abs(corrected), 1.0)
+        # Power curve: small corrections → gentle, large → aggressive
         shaped = abs_c ** 0.7
-        sign = 1 if corrected >= 0 else -1
 
-        base_left = self.left_neutral - self.left_drive_offset * speed_factor
-        base_right = self.right_neutral + self.right_drive_offset * speed_factor
-
-        left_pwm  = base_left - sign * shaped * left_max_steer
-        right_pwm = base_right - sign * shaped * right_max_steer
-
-        left_pwm  = min(left_pwm, self.left_neutral - 30)
-        right_pwm = max(right_pwm, self.right_neutral + 30)
+        # Dead zone: drive straight when correction is tiny
+        STEER_DEADZONE = 0.04
+        if abs_c < STEER_DEADZONE:
+            # Both wheels forward at normal speed
+            left_pwm = self.left_neutral - self.left_drive_offset * speed_factor
+            right_pwm = self.right_neutral + self.right_drive_offset * speed_factor
+            steer_desc = 'straight'
+        elif corrected > 0:
+            # LEFT servo drives forward, RIGHT servo stops
+            left_speed = self.left_drive_offset * (0.5 + 0.5 * shaped) * speed_factor
+            left_pwm = self.left_neutral - left_speed    # below neutral = forward
+            right_pwm = self.right_stop_point             # neutral = stopped
+            steer_desc = f'LEFT fwd({int(left_pwm)}us)'
+        else:
+            # RIGHT servo drives forward, LEFT servo stops
+            right_speed = self.right_drive_offset * (0.5 + 0.5 * shaped) * speed_factor
+            right_pwm = self.right_neutral + right_speed  # above neutral = forward
+            left_pwm = self.left_stop_point                # neutral = stopped
+            steer_desc = f'RIGHT fwd({int(right_pwm)}us)'
 
         self.status = 'forward_steer'
-        self._set_both_pwm(int(left_pwm), int(right_pwm))
-        self._current_left_us = int(left_pwm)
-        self._current_right_us = int(right_pwm)
+        logger.debug(
+            f"forward_steer: corr={correction:+.3f} inv={STEER_INVERT} "
+            f"→ corrected={corrected:+.3f} → {steer_desc} "
+            f"L={int(left_pwm)}us R={int(right_pwm)}us"
+        )
+        # Use EMA-filtered path to smooth jitter on high-frequency steering
+        self._ema_set_both(int(left_pwm), int(right_pwm))
 
     def stop(self):
-        """Ramp to stop point, then disable PWM."""
+        """Soft-brake: ramp to stop point, then FORCE-KILL PWM with retries.
+        This is the critical path — must always succeed to prevent runaway servo."""
         self.status = 'idle'
         self._cancel_ramp()
 
+        # Phase 1: Soft deceleration — ramp down to stop point
         if self._pwm_active:
             self._do_ramp(self.left_stop_point, self.right_stop_point)
-            time.sleep(0.05)
+            time.sleep(0.03)
 
-        # Stop PWM output entirely
-        try:
-            if self._left_pwm:
-                self._left_pwm.stop()
-            if self._right_pwm:
-                self._right_pwm.stop()
-        except Exception as e:
-            logger.warning(f"PWM stop error: {e}")
-        self._pwm_active = False
+        # Phase 2: Force-kill PWM output with retries
+        #   Even if ramp didn't finish or state is corrupted, ALWAYS stop PWM
+        self._force_stop_pwm()
 
+        # Reset EMA state to neutral (prevents stale values on next start)
+        self._ema_left_us = float(self.left_neutral)
+        self._ema_right_us = float(self.right_neutral)
         self._current_left_us = self.left_neutral
         self._current_right_us = self.right_neutral
-        logger.info("Stop: ramped to stop point → HW PWM disabled")
+        logger.info("Stop: ramp→stop_point → force-kill PWM (retried)")
+
+    def _force_stop_pwm(self):
+        """Aggressively stop all PWM output with retries.
+        Prevents runaway servo by retrying .stop() multiple times."""
+        for attempt in range(STOP_RETRIES):
+            try:
+                if self._left_pwm:
+                    self._left_pwm.stop()
+                if self._right_pwm:
+                    self._right_pwm.stop()
+            except Exception as e:
+                logger.warning(f"PWM force-stop attempt {attempt+1}/{STOP_RETRIES}: {e}")
+            if attempt < STOP_RETRIES - 1:
+                time.sleep(STOP_RETRY_MS / 1000.0)
+        self._pwm_active = False
 
     def cleanup(self):
         """Stop motors and release PWM resources."""
@@ -440,24 +577,25 @@ class AutoNavigator:
     """
     Auto-drive controller that follows a path of waypoints.
 
-    Calibration constants (tweak for your physical car):
-      DRIVE_TIME_PER_PIXEL  – seconds of motor-on time per canvas-pixel distance
-      TURN_90_TIME          – seconds to pivot 90°
-      TURN_CORRECTION       – multiplier for turns (>1 = overcorrect, <1 = under)
-      DRIFT_CORRECTION_TIME – extra correction pulse at each waypoint
-      POSITION_REPORT_INTERVAL – seconds between intermediate position reports
+    Calibration constants (all from env vars — tweak in hardware.env):
+      NAV_DRIVE_TIME_PER_COORD  – seconds per map coordinate unit
+      NAV_TURN_90_TIME          – seconds for a 90° pivot
+      NAV_TURN_CORRECTION       – turn overshoot multiplier
+      NAV_DRIFT_CORRECTION_TIME – counter-steer pulse after turn
+      NAV_POSITION_REPORT_INTERVAL – progress report cadence
+      NAV_LINE_FOLLOW_INTERVAL  – steering update rate (lower = more frequent)
     """
 
-    # ── Calibration (adjust to your chassis / wheel diameter) ──
-    DRIVE_TIME_PER_PIXEL  = 0.008    # seconds per canvas-pixel of distance
-    TURN_90_TIME          = 1.60     # seconds for a 90° pivot  (calibrated for full rotation)
-    TURN_CORRECTION       = 1.05     # 5 % over-rotate to counteract drift
-    DRIFT_CORRECTION_TIME = 0.10     # short counter-steer pulse after each turn
-    POSITION_REPORT_INTERVAL = 0.40  # seconds between intermediate position reports
+    # ── Calibration (ALL from env vars for live tuning) ──
+    DRIVE_TIME_PER_COORD  = float(os.environ.get('NAV_DRIVE_TIME_PER_COORD', '0.002'))
+    TURN_90_TIME          = float(os.environ.get('NAV_TURN_90_TIME', '1.60'))
+    TURN_CORRECTION       = float(os.environ.get('NAV_TURN_CORRECTION', '1.05'))
+    DRIFT_CORRECTION_TIME = float(os.environ.get('NAV_DRIFT_CORRECTION_TIME', '0.10'))
+    POSITION_REPORT_INTERVAL = float(os.environ.get('NAV_POSITION_REPORT_INTERVAL', '0.40'))
 
-    # ── Line-following with continuous differential steering ──
-    LINE_FOLLOW_INTERVAL  = 0.10     # seconds between camera checks (faster for smoother control)
-    LINE_FOLLOW_THRESHOLD = 0.03     # min |offset| to trigger any steering (matches dead-zone)
+    # ── Line-following with continuous single-servo steering ──
+    LINE_FOLLOW_INTERVAL  = float(os.environ.get('NAV_LINE_FOLLOW_INTERVAL', '0.05'))
+    LINE_FOLLOW_THRESHOLD = 0.0      # always steer — forward_steer handles deadzone internally
 
     # Stuck detection: if correction stays same sign for too many consecutive frames
     STUCK_CONSECUTIVE_LIMIT = 12     # ~1.2s at 0.10 interval
@@ -476,8 +614,9 @@ class AutoNavigator:
         self._stuck_counter = 0
         self._stuck_sign = 0
 
-        logger.info("AutoNavigator initialised (line-follow=%s)",
-                    'enabled' if line_follower and line_follower.is_ready else 'disabled')
+        logger.info("AutoNavigator initialised (line-follow=%s, drive_time_per_coord=%.4f, turn_90=%.2fs)",
+                    'enabled' if line_follower and line_follower.is_ready else 'disabled',
+                    self.DRIVE_TIME_PER_COORD, self.TURN_90_TIME)
 
     # ── Public API ──────────────────────────────────────────
 
@@ -538,7 +677,7 @@ class AutoNavigator:
                 self.heading = target
 
                 # ── Drive forward with continuous differential steering ──
-                drive_sec = dist * self.DRIVE_TIME_PER_PIXEL
+                drive_sec = dist * self.DRIVE_TIME_PER_COORD
                 logger.info(
                     f"  ➜ {cur['pointId']} → {nxt['pointId']}  "
                     f"dist={dist:.0f}px  drive={drive_sec:.2f}s  heading={self.heading}"
@@ -551,83 +690,81 @@ class AutoNavigator:
                 self._stuck_counter = 0
                 self._stuck_sign = 0
 
-                self.motor.forward()
+                # Drive with CONTINUOUS steering from tick 0.
+                # Never call motor.forward() in the loop — always forward_steer()
+                # so the car corrects every single servo rotation cycle.
+                # forward_steer(0) drives both wheels straight (deadzone handles it).
+                self.motor.forward_steer(0.0)
 
-                # Report interpolated positions during drive
-                # Use wall-clock time so camera/model processing time counts
                 segment_start = time.time()
+                last_report = segment_start
                 while (time.time() - segment_start) < drive_sec and self.navigating:
-                    await asyncio.sleep(self.LINE_FOLLOW_INTERVAL)
-                    elapsed = time.time() - segment_start
+                    loop_start = time.time()
 
-                    # ── Camera line-following with differential steering ──
-                    # LineFollower.analyse_frame() returns a fused canny+unet
-                    # steer value. Canny already has PD+EMA internally, so we
-                    # do NOT apply another PD layer here (avoids double-derivative
-                    # which causes over-correction and oscillation).
+                    # ── Camera → CTE → PID → Steer every tick ──
                     correction = await self._get_line_correction()
-                    if abs(correction) >= self.LINE_FOLLOW_THRESHOLD:
-                        steer = max(-1.0, min(1.0, correction))
+                    steer = max(-1.0, min(1.0, correction))
 
-                        # Apply differential steering (no stop-turn-resume!)
-                        self.motor.forward_steer(steer)
+                    # Apply single-servo steering EVERY tick
+                    # forward_steer internally: lệch → 1 servo quay, 1 servo dừng
+                    #                           centered → both servo forward
+                    self.motor.forward_steer(steer)
 
-                        # Stuck detection
-                        corr_sign = 1 if correction > 0 else -1
-                        if (corr_sign == self._stuck_sign and
-                                abs(correction) >= self.STUCK_MIN_MAGNITUDE):
-                            self._stuck_counter += 1
+                    # Stuck detection
+                    corr_sign = 1 if correction > 0 else -1
+                    if (corr_sign == self._stuck_sign and
+                            abs(correction) >= self.STUCK_MIN_MAGNITUDE):
+                        self._stuck_counter += 1
+                    else:
+                        self._stuck_counter = 0
+                        self._stuck_sign = corr_sign
+
+                    if self._stuck_counter >= self.STUCK_CONSECUTIVE_LIMIT:
+                        logger.warning(f"  ⚠ STUCK detected ({self._stuck_counter} frames), "
+                                       f"aggressive reverse steer")
+                        self.motor.stop()
+                        await asyncio.sleep(0.1)
+                        if correction > 0:
+                            self.motor.turn_left()
                         else:
-                            self._stuck_counter = 0
-                            self._stuck_sign = corr_sign
-
-                        if self._stuck_counter >= self.STUCK_CONSECUTIVE_LIMIT:
-                            # Servo likely stuck — aggressive opposite correction
-                            logger.warning(f"  ⚠ STUCK detected ({self._stuck_counter} frames), "
-                                           f"aggressive reverse steer")
-                            self.motor.stop()
-                            await asyncio.sleep(0.1)
-                            # Brief hard opposite turn
-                            if correction > 0:
-                                self.motor.turn_left()
-                            else:
-                                self.motor.turn_right()
-                            await asyncio.sleep(0.25)
-                            self.motor.forward()
-                            self._stuck_counter = 0
-                            await emit_cb('navigation-log', {
-                                'type': 'stuck-recovery',
-                                'correction': round(correction, 3),
-                                'timestamp': time.time(),
-                            })
-
-                        logger.debug(f"    🔧 steer {steer:+.3f} (correction={correction:+.3f})")
+                            self.motor.turn_right()
+                        await asyncio.sleep(0.25)
+                        self.motor.forward_steer(0.0)
+                        self._stuck_counter = 0
                         await emit_cb('navigation-log', {
-                            'type': 'line-correct',
+                            'type': 'stuck-recovery',
                             'correction': round(correction, 3),
-                            'steer': round(steer, 3),
                             'timestamp': time.time(),
                         })
-                    else:
-                        # Centered — drive straight
-                        self.motor.forward()
-                        self._stuck_counter = 0
+
+                    if abs(correction) > 0.03:
+                        logger.debug(f"    🔧 steer {steer:+.3f} (correction={correction:+.3f})")
 
                     self._prev_correction = correction
 
                     # ── Position report at POSITION_REPORT_INTERVAL cadence ──
+                    elapsed = time.time() - segment_start
                     progress = min(elapsed / drive_sec, 1.0)
-                    ix = cur['x'] + dx * progress
-                    iy = cur['y'] + dy * progress
-                    await emit_cb('navigation-log', {
-                        'type': 'moving',
-                        'x': round(ix, 1),
-                        'y': round(iy, 1),
-                        'fromPoint': cur['pointId'],
-                        'toPoint': nxt['pointId'],
-                        'progress': round(progress * 100),
-                        'timestamp': time.time(),
-                    })
+                    if (time.time() - last_report) >= self.POSITION_REPORT_INTERVAL:
+                        last_report = time.time()
+                        ix = cur['x'] + dx * progress
+                        iy = cur['y'] + dy * progress
+                        await emit_cb('navigation-log', {
+                            'type': 'moving',
+                            'x': round(ix, 1),
+                            'y': round(iy, 1),
+                            'fromPoint': cur['pointId'],
+                            'toPoint': nxt['pointId'],
+                            'progress': round(progress * 100),
+                            'steer': round(steer, 3),
+                            'timestamp': time.time(),
+                        })
+
+                    # Sleep remainder of interval
+                    loop_elapsed = time.time() - loop_start
+                    sleep_time = self.LINE_FOLLOW_INTERVAL - loop_elapsed
+                    if sleep_time > 0:
+                        await asyncio.sleep(sleep_time)
 
                 self.motor.stop()
                 await asyncio.sleep(0.20)
@@ -697,12 +834,6 @@ class AutoNavigator:
         """Execute a pivot turn."""
         if direction == 'straight':
             return
-
-        # Unlock canny ROI before turning — car will be on a different lane
-        if (self._line_follower and self._line_follower._canny_available
-                and self._line_follower._canny_detector is not None):
-            self._line_follower._canny_detector.unlock_roi()
-            logger.info("  🔓 Canny ROI unlocked for turn")
 
         t = self.TURN_90_TIME * self.TURN_CORRECTION
         if direction == 'uturn':

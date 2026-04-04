@@ -26,7 +26,7 @@ export default function MapBuilderPage() {
 
     // Camera
     const [cameraOn, setCameraOn] = useState(false);
-    const [cameraMode, setCameraMode] = useState('raw'); // 'raw' | 'canny' | 'unet' | 'sign' | 'all'
+    const [cameraMode, setCameraMode] = useState('raw'); // 'raw' | 'canny' | 'sign' | 'all'
     const cameraImgRef = useRef(null);
 
     // Screenshot
@@ -80,9 +80,6 @@ export default function MapBuilderPage() {
             if (data.cannySteering !== undefined) {
                 logMsg += ` | Canny: ${data.cannySteering.toFixed(3)}`;
             }
-            if (data.unetSteering !== undefined) {
-                logMsg += ` | UNet: ${data.unetSteering.toFixed(3)}`;
-            }
             if (data.laneQuality !== undefined) {
                 logMsg += ` | Lane: ${(data.laneQuality * 100).toFixed(0)}%`;
             }
@@ -108,7 +105,6 @@ export default function MapBuilderPage() {
                     steering: data.steering,
                     laneQuality: data.laneQuality,
                     cannySteering: data.cannySteering,
-                    unetSteering: data.unetSteering,
                     virtualLeft: data.virtualLeft,
                     virtualRight: data.virtualRight,
                     driftBias: data.driftBias,
@@ -199,7 +195,7 @@ export default function MapBuilderPage() {
     // Request canny analysis
     const handleAnalyse = useCallback(() => {
         socket.emit('map-build-analyse');
-        addLog('🔍 Đang phân tích canny + UNet...');
+        addLog('🔍 Đang phân tích canny...');
     }, [addLog]);
 
     // Toggle sign detection
@@ -393,13 +389,13 @@ export default function MapBuilderPage() {
                                 <VideoCameraIcon className="w-4 h-4" /> Camera
                             </h2>
                             <div className="flex items-center gap-1.5">
-                                {['raw', 'canny', 'unet', 'sign', 'all'].map(mode => (
+                                {['raw', 'canny', 'sign', 'all'].map(mode => (
                                     <button key={mode} onClick={() => setCameraMode(mode)}
                                         className={`px-2 py-1 text-[10px] font-medium rounded transition ${cameraMode === mode
-                                                ? mode === 'all' ? 'bg-amber-500 text-white' : 'bg-purple-500 text-white'
-                                                : 'bg-gray-100 text-gray-500 hover:bg-gray-200'
+                                            ? mode === 'all' ? 'bg-amber-500 text-white' : 'bg-purple-500 text-white'
+                                            : 'bg-gray-100 text-gray-500 hover:bg-gray-200'
                                             }`}>
-                                        {{ raw: 'Raw', canny: 'Canny', unet: 'UNet', sign: 'Sign', all: 'All' }[mode]}
+                                        {{ raw: 'Raw', canny: 'Canny', sign: 'Sign', all: 'All' }[mode]}
                                     </button>
                                 ))}
                                 {cameraOn && (
@@ -485,7 +481,7 @@ export default function MapBuilderPage() {
                         {/* Analyse button */}
                         <button onClick={handleAnalyse}
                             className="w-full px-3 py-2 text-sm bg-purple-50 text-purple-600 rounded-lg border border-purple-200 hover:bg-purple-100 transition mb-3">
-                            🔍 Phân tích Canny + UNet
+                            🔍 Phân tích Canny
                         </button>
 
                         {/* Road sign detection */}
@@ -571,7 +567,7 @@ export default function MapBuilderPage() {
                                     </p>
                                     {pendingPoint.cannySteering !== undefined && (
                                         <p className="text-[10px] text-gray-300 mt-0.5">
-                                            Canny: {pendingPoint.cannySteering?.toFixed(3)} | UNet: {pendingPoint.unetSteering?.toFixed(3)}
+                                            Canny: {pendingPoint.cannySteering?.toFixed(3)}
                                         </p>
                                     )}
                                     {(pendingPoint.virtualLeft || pendingPoint.virtualRight) && (
@@ -689,7 +685,7 @@ export default function MapBuilderPage() {
                     {/* Log panel */}
                     <div className="bg-white rounded-2xl border border-gray-200 overflow-hidden flex flex-col" style={{ maxHeight: 320 }}>
                         <div className="flex items-center justify-between px-4 py-2.5 border-b bg-gray-50">
-                            <h2 className="text-sm font-semibold text-gray-600">📝 Log dò map (Canny + UNet)</h2>
+                            <h2 className="text-sm font-semibold text-gray-600">📝 Log dò map (Canny)</h2>
                             <button onClick={() => setLogs([])}
                                 className="text-[10px] text-gray-400 hover:text-red-500 transition">Xoá</button>
                         </div>
@@ -701,9 +697,8 @@ export default function MapBuilderPage() {
                                             log.includes('Drift') ? 'text-cyan-300' :
                                                 log.includes('🔄') ? 'text-yellow-300' :
                                                     log.includes('Canny') ? 'text-purple-300' :
-                                                        log.includes('UNet') ? 'text-cyan-300' :
-                                                            log.includes('📸') ? 'text-blue-300' :
-                                                                log.includes('🚦') ? 'text-emerald-300' : ''
+                                                        log.includes('📸') ? 'text-blue-300' :
+                                                            log.includes('🚦') ? 'text-emerald-300' : ''
                                     }`}>
                                     {log}
                                 </div>

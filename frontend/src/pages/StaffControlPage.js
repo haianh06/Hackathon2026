@@ -545,7 +545,7 @@ export default function StaffControlPage() {
                                 </div>
                                 <div className="flex justify-between">
                                     <span className="text-gray-500">Line-Follow</span>
-                                    <span className="font-medium">{hwStatus.line_follower ? 'ResUNet' : 'Off'}</span>
+                                    <span className="font-medium">{hwStatus.line_follower ? 'Canny' : 'Off'}</span>
                                 </div>
                                 <div className="flex justify-between">
                                     <span className="text-gray-500">Camera</span>

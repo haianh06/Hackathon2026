@@ -88,7 +88,7 @@ function HardwareStatus() {
                     <div className="hw-info-item">
                         <span className="hw-label">Line-Follow</span>
                         <span className={`hw-value ${hwStatus.line_follower ? 'ok' : ''}`}>
-                            {hwStatus.line_follower ? '✅ ResUNet active' : '⚠️ Fallback / off'}
+                            {hwStatus.line_follower ? '✅ Canny active' : '⚠️ Fallback / off'}
                         </span>
                     </div>
                 </div>
