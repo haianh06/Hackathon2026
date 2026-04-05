@@ -26,7 +26,7 @@ export default function MapBuilderPage() {
 
     // Camera
     const [cameraOn, setCameraOn] = useState(false);
-    const [cameraMode, setCameraMode] = useState('raw'); // 'raw' | 'canny' | 'sign' | 'all'
+    const [cameraMode, setCameraMode] = useState('raw'); // 'raw' | 'lane' | 'sign' | 'all'
     const cameraImgRef = useRef(null);
 
     // Screenshot
@@ -53,6 +53,11 @@ export default function MapBuilderPage() {
     const [signDetecting, setSignDetecting] = useState(false);
     const [signDetections, setSignDetections] = useState([]);
 
+    // Odometry log
+    const [odomLogs, setOdomLogs] = useState([]);
+    const odomLogEndRef = useRef(null);
+    const [odomAutoScroll, setOdomAutoScroll] = useState(true);
+
     const addLog = useCallback((msg) => {
         const ts = new Date().toLocaleTimeString('vi-VN');
         setLogs(prev => {
@@ -77,8 +82,8 @@ export default function MapBuilderPage() {
             if (data.steering !== undefined && data.steering !== null) {
                 logMsg += ` | Steer: ${data.steering.toFixed(3)}`;
             }
-            if (data.cannySteering !== undefined) {
-                logMsg += ` | Canny: ${data.cannySteering.toFixed(3)}`;
+            if (data.laneSteering !== undefined) {
+                logMsg += ` | Lane: ${data.laneSteering.toFixed(3)}`;
             }
             if (data.laneQuality !== undefined) {
                 logMsg += ` | Lane: ${(data.laneQuality * 100).toFixed(0)}%`;
@@ -98,13 +103,19 @@ export default function MapBuilderPage() {
 
             addLog(logMsg);
 
+            // Odometry data from step result
+            if (data.odom) {
+                const odomMsg = `📍 Odom: (${data.odom.x?.toFixed(3)}, ${data.odom.y?.toFixed(3)}) θ=${data.odom.theta?.toFixed(1)}° | CTE=${(data.odomCte || 0).toFixed(4)} | dist=${(data.odomDist || 0).toFixed(3)}m`;
+                addLog(odomMsg);
+            }
+
             // Set as pending point for approval
             if (!data.turned) {
                 setPendingPoint({
                     x: data.x, y: data.y,
                     steering: data.steering,
                     laneQuality: data.laneQuality,
-                    cannySteering: data.cannySteering,
+                    laneSteering: data.laneSteering,
                     virtualLeft: data.virtualLeft,
                     virtualRight: data.virtualRight,
                     driftBias: data.driftBias,
@@ -115,7 +126,7 @@ export default function MapBuilderPage() {
         const handleAnalysis = (data) => {
             setAnalysis(data.analysis);
             if (data.analysis) {
-                let msg = `🔍 Canny: steer=${data.analysis.steering?.toFixed(3)} | quality=${(data.analysis.laneQuality * 100).toFixed(0)}% | centers=${data.analysis.centersCount}`;
+                let msg = `🔍 Lane: steer=${data.analysis.steering?.toFixed(3)} | quality=${(data.analysis.laneQuality * 100).toFixed(0)}% | centers=${data.analysis.centersCount}`;
                 if (data.analysis.virtualLeft) msg += ' | VIRTUAL-L';
                 if (data.analysis.virtualRight) msg += ' | VIRTUAL-R';
                 addLog(msg);
@@ -125,9 +136,19 @@ export default function MapBuilderPage() {
         socket.on('map-build-position', handlePosition);
         socket.on('map-build-analysis', handleAnalysis);
 
+        const handleOdomLog = (data) => {
+            setOdomLogs(prev => {
+                const entry = `[${data.source}] (${data.x?.toFixed(3)}, ${data.y?.toFixed(3)}) θ=${data.theta?.toFixed(1)}° CTE=${data.cte?.toFixed(4)} ds=${data.ds?.toFixed(4)} dist=${data.dist?.toFixed(3)}m conf=${data.confidence?.toFixed(2)}`;
+                const next = [...prev, entry];
+                return next.length > 500 ? next.slice(-400) : next;
+            });
+        };
+        socket.on('odom-log', handleOdomLog);
+
         return () => {
             socket.off('map-build-position', handlePosition);
             socket.off('map-build-analysis', handleAnalysis);
+            socket.off('odom-log', handleOdomLog);
         };
     }, [addLog]);
 
@@ -164,11 +185,6 @@ export default function MapBuilderPage() {
         };
     }, [addLog]);
 
-    // Auto-scroll logs
-    useEffect(() => {
-        if (logEndRef.current) logEndRef.current.scrollIntoView({ behavior: 'smooth' });
-    }, [logs]);
-
     // Move one step forward
     const handleStep = useCallback(() => {
         if (isMoving) return;
@@ -192,10 +208,10 @@ export default function MapBuilderPage() {
         addLog('⏹ Dừng');
     }, [addLog]);
 
-    // Request canny analysis
+    // Request lane analysis
     const handleAnalyse = useCallback(() => {
         socket.emit('map-build-analyse');
-        addLog('🔍 Đang phân tích canny...');
+        addLog('🔍 Đang phân tích lane...');
     }, [addLog]);
 
     // Toggle sign detection
@@ -389,13 +405,13 @@ export default function MapBuilderPage() {
                                 <VideoCameraIcon className="w-4 h-4" /> Camera
                             </h2>
                             <div className="flex items-center gap-1.5">
-                                {['raw', 'canny', 'sign', 'all'].map(mode => (
+                                {['raw', 'lane', 'sign', 'all'].map(mode => (
                                     <button key={mode} onClick={() => setCameraMode(mode)}
                                         className={`px-2 py-1 text-[10px] font-medium rounded transition ${cameraMode === mode
                                             ? mode === 'all' ? 'bg-amber-500 text-white' : 'bg-purple-500 text-white'
                                             : 'bg-gray-100 text-gray-500 hover:bg-gray-200'
                                             }`}>
-                                        {{ raw: 'Raw', canny: 'Canny', sign: 'Sign', all: 'All' }[mode]}
+                                        {{ raw: 'Raw', lane: 'Lane', sign: 'Sign', all: 'All' }[mode]}
                                     </button>
                                 ))}
                                 {cameraOn && (
@@ -481,7 +497,7 @@ export default function MapBuilderPage() {
                         {/* Analyse button */}
                         <button onClick={handleAnalyse}
                             className="w-full px-3 py-2 text-sm bg-purple-50 text-purple-600 rounded-lg border border-purple-200 hover:bg-purple-100 transition mb-3">
-                            🔍 Phân tích Canny
+                            🔍 Phân tích Lane
                         </button>
 
                         {/* Road sign detection */}
@@ -565,9 +581,9 @@ export default function MapBuilderPage() {
                                     <p className="text-xs text-gray-400 mt-1">
                                         Steer: {pendingPoint.steering?.toFixed(3) ?? 'N/A'} | Quality: {((pendingPoint.laneQuality || 0) * 100).toFixed(0)}%
                                     </p>
-                                    {pendingPoint.cannySteering !== undefined && (
+                                    {pendingPoint.laneSteering !== undefined && (
                                         <p className="text-[10px] text-gray-300 mt-0.5">
-                                            Canny: {pendingPoint.cannySteering?.toFixed(3)}
+                                            Lane: {pendingPoint.laneSteering?.toFixed(3)}
                                         </p>
                                     )}
                                     {(pendingPoint.virtualLeft || pendingPoint.virtualRight) && (
@@ -685,25 +701,56 @@ export default function MapBuilderPage() {
                     {/* Log panel */}
                     <div className="bg-white rounded-2xl border border-gray-200 overflow-hidden flex flex-col" style={{ maxHeight: 320 }}>
                         <div className="flex items-center justify-between px-4 py-2.5 border-b bg-gray-50">
-                            <h2 className="text-sm font-semibold text-gray-600">📝 Log dò map (Canny)</h2>
+                            <h2 className="text-sm font-semibold text-gray-600">📝 Log dò map (Lane Follower)</h2>
                             <button onClick={() => setLogs([])}
                                 className="text-[10px] text-gray-400 hover:text-red-500 transition">Xoá</button>
                         </div>
-                        <div className="flex-1 overflow-y-auto p-3 font-mono text-[11px] leading-relaxed bg-gray-900 text-green-400">
+                        <div className="flex-1 overflow-y-auto p-3 font-mono text-[11px] leading-relaxed bg-gray-900 text-green-400" style={{ overflowAnchor: 'none' }}>
                             {logs.map((log, idx) => (
                                 <div key={idx} className={`py-0.5 ${log.includes('✅') ? 'text-green-300 font-bold' :
                                     log.includes('❌') ? 'text-red-400' :
                                         log.includes('VIRTUAL') ? 'text-orange-400' :
                                             log.includes('Drift') ? 'text-cyan-300' :
                                                 log.includes('🔄') ? 'text-yellow-300' :
-                                                    log.includes('Canny') ? 'text-purple-300' :
+                                                    log.includes('Lane') ? 'text-purple-300' :
                                                         log.includes('📸') ? 'text-blue-300' :
-                                                            log.includes('🚦') ? 'text-emerald-300' : ''
+                                                            log.includes('🚦') ? 'text-emerald-300' :
+                                                                log.includes('Odom') ? 'text-cyan-200' : ''
                                     }`}>
                                     {log}
                                 </div>
                             ))}
                             <div ref={logEndRef} />
+                        </div>
+                    </div>
+
+                    {/* Odometry Log panel */}
+                    <div className="bg-white rounded-2xl border border-gray-200 overflow-hidden flex flex-col" style={{ maxHeight: 280 }}>
+                        <div className="flex items-center justify-between px-4 py-2.5 border-b bg-gray-50">
+                            <h2 className="text-sm font-semibold text-gray-600">📐 Odometry (Oxy + CTE)</h2>
+                            <div className="flex items-center gap-2">
+                                <label className="flex items-center gap-1 text-[10px] text-gray-400 cursor-pointer">
+                                    <input type="checkbox" checked={odomAutoScroll}
+                                        onChange={e => setOdomAutoScroll(e.target.checked)}
+                                        className="w-3 h-3" />
+                                    Auto-scroll
+                                </label>
+                                <button onClick={() => setOdomLogs([])}
+                                    className="text-[10px] text-gray-400 hover:text-red-500 transition">Xoá</button>
+                            </div>
+                        </div>
+                        <div className="flex-1 overflow-y-auto p-3 font-mono text-[10px] leading-relaxed bg-gray-950 text-cyan-300"
+                            style={{ overflowAnchor: 'none' }}
+                            ref={el => {
+                                if (el && odomAutoScroll) el.scrollTop = el.scrollHeight;
+                            }}>
+                            {odomLogs.length === 0 && <div className="text-gray-600 text-center py-4">Chờ xe di chuyển...</div>}
+                            {odomLogs.map((log, idx) => (
+                                <div key={idx} className={`py-0.5 ${log.includes('VISION') ? 'text-green-300' : log.includes('ODOM') ? 'text-amber-300' : ''}`}>
+                                    {log}
+                                </div>
+                            ))}
+                            <div ref={odomLogEndRef} />
                         </div>
                     </div>
                 </div>

@@ -134,6 +134,11 @@ function setupSocket(io) {
             io.emit('navigation-log', data);
         });
 
+        // ====== Odometry real-time logs from Python daemon ======
+        socket.on('odom-log', (data) => {
+            io.to('admin').emit('odom-log', data);
+        });
+
         // ====== Motor Control from Frontend ======
         socket.on('motor-control', (data) => {
             io.to('hardware').emit('motor-command', data);

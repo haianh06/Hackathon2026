@@ -90,7 +90,7 @@ services:
       - "host.docker.internal:host-gateway"
     env_file:
       - ./hardware.env
-      - ./canny.env
+      - ./lane.env
     environment:
       SERVER_URL: http://backend:5000
       CAMERA_HOST: host.docker.internal

@@ -34,9 +34,6 @@ RUN pip install --no-cache-dir --timeout 600 --retries 5 \
 # Copy model weights (UNet line follower only; road sign uses C++ container)
 COPY line_following/best_unet.pth ./line_following/best_unet.pth
 
-# Copy canny edge detection module
-COPY canny-edge-detection-main/ ./canny-edge-detection-main/
-
 # Copy hardware source code
 COPY hardware/ ./hardware/
 

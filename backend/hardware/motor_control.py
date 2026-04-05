@@ -413,21 +413,19 @@ class HardwarePWMController:
 
     def forward_steer(self, correction, speed_factor=1.0):
         """
-        Drive forward with SINGLE-SERVO steering.
+        Drive forward with DIFFERENTIAL steering.
 
-        Only ONE servo drives to pull the nose back toward the lane center.
-        The other servo stays at neutral (stopped). This prevents uneven
-        dual-servo speeds from dragging the car further off-course.
+        Both servos always spin. The correction is split symmetrically:
+          - Straight:    both wheels at full forward speed
+          - Correction:  one wheel speeds up by half the delta,
+                         the other slows down (or reverses) by half.
+        This keeps the average speed constant and produces much
+        smoother trajectory corrections than stopping one wheel.
 
         correction in [-1.0 … +1.0]:
           positive → car drifted LEFT  → need to steer RIGHT
           negative → car drifted RIGHT → need to steer LEFT
           ~0       → both servos drive forward (straight)
-
-        Which servo drives depends on MOTOR_STEER_INVERT:
-         - Default (0): positive → LEFT servo forward → nose RIGHT
-         - Inverted (1): positive → RIGHT servo forward → nose RIGHT
-        Use MOTOR_STEER_INVERT=1 if the car steers the wrong way.
 
         Mirror-mounted servos:
           Left (GPIO12):  forward = neutral - offset  (below neutral)
@@ -441,28 +439,48 @@ class HardwarePWMController:
             corrected = -corrected
 
         abs_c = min(abs(corrected), 1.0)
-        # Power curve: small corrections → gentle, large → aggressive
-        shaped = abs_c ** 0.7
+        # Softer power curve for smooth feel
+        shaped = abs_c ** 0.8
+
+        # Steering rate limiter: max change per tick (prevents jerks)
+        MAX_STEER_RATE = 0.10   # per call (~33Hz → 3.3/s max)
+        if hasattr(self, '_last_corrected'):
+            delta = corrected - self._last_corrected
+            if abs(delta) > MAX_STEER_RATE:
+                corrected = self._last_corrected + MAX_STEER_RATE * (1 if delta > 0 else -1)
+                abs_c = min(abs(corrected), 1.0)
+                shaped = abs_c ** 0.8
+        self._last_corrected = corrected
+
+        # Base forward speed for each motor
+        base_left = self.left_drive_offset * speed_factor
+        base_right = self.right_drive_offset * speed_factor
 
         # Dead zone: drive straight when correction is tiny
-        STEER_DEADZONE = 0.04
+        STEER_DEADZONE = 0.03
         if abs_c < STEER_DEADZONE:
-            # Both wheels forward at normal speed
-            left_pwm = self.left_neutral - self.left_drive_offset * speed_factor
-            right_pwm = self.right_neutral + self.right_drive_offset * speed_factor
+            left_pwm = self.left_neutral - base_left
+            right_pwm = self.right_neutral + base_right
             steer_desc = 'straight'
-        elif corrected > 0:
-            # LEFT servo drives forward, RIGHT servo stops
-            left_speed = self.left_drive_offset * (0.5 + 0.5 * shaped) * speed_factor
-            left_pwm = self.left_neutral - left_speed    # below neutral = forward
-            right_pwm = self.right_stop_point             # neutral = stopped
-            steer_desc = f'LEFT fwd({int(left_pwm)}us)'
         else:
-            # RIGHT servo drives forward, LEFT servo stops
-            right_speed = self.right_drive_offset * (0.5 + 0.5 * shaped) * speed_factor
-            right_pwm = self.right_neutral + right_speed  # above neutral = forward
-            left_pwm = self.left_stop_point                # neutral = stopped
-            steer_desc = f'RIGHT fwd({int(right_pwm)}us)'
+            # Differential: split correction symmetrically
+            # steer_amount 0..1 → how much to shift between wheels
+            steer_amount = shaped
+
+            if corrected > 0:
+                # Steer RIGHT → left wheel faster, right wheel slower/reverse
+                left_speed = base_left * (1.0 + 0.5 * steer_amount)
+                right_speed = base_right * (1.0 - steer_amount)
+                left_pwm = self.left_neutral - left_speed
+                right_pwm = self.right_neutral + right_speed
+                steer_desc = f'diff-R L={int(left_pwm)} R={int(right_pwm)}'
+            else:
+                # Steer LEFT → right wheel faster, left wheel slower/reverse
+                right_speed = base_right * (1.0 + 0.5 * steer_amount)
+                left_speed = base_left * (1.0 - steer_amount)
+                left_pwm = self.left_neutral - left_speed
+                right_pwm = self.right_neutral + right_speed
+                steer_desc = f'diff-L L={int(left_pwm)} R={int(right_pwm)}'
 
         self.status = 'forward_steer'
         logger.debug(
@@ -594,28 +612,30 @@ class AutoNavigator:
     POSITION_REPORT_INTERVAL = float(os.environ.get('NAV_POSITION_REPORT_INTERVAL', '0.40'))
 
     # ── Line-following with continuous single-servo steering ──
-    LINE_FOLLOW_INTERVAL  = float(os.environ.get('NAV_LINE_FOLLOW_INTERVAL', '0.05'))
+    LINE_FOLLOW_INTERVAL  = float(os.environ.get('NAV_LINE_FOLLOW_INTERVAL', '0.03'))
     LINE_FOLLOW_THRESHOLD = 0.0      # always steer — forward_steer handles deadzone internally
 
     # Stuck detection: if correction stays same sign for too many consecutive frames
     STUCK_CONSECUTIVE_LIMIT = 12     # ~1.2s at 0.10 interval
     STUCK_MIN_MAGNITUDE     = 0.4    # only count as "stuck" if correction > this
 
-    def __init__(self, motor_controller, camera_getter=None, line_follower=None):
+    def __init__(self, motor_controller, camera_getter=None, line_follower=None, odometry=None):
         self.motor = motor_controller
         self.heading = None          # current (dx, dy) unit-direction vector
         self.navigating = False
         self._nav_task = None
         self._get_camera_frame = camera_getter   # async () → bytes|None
         self._line_follower = line_follower       # LineFollower instance
+        self._odometry = odometry                 # OdometryTracker instance
 
         # PD controller state
         self._prev_correction = 0.0
         self._stuck_counter = 0
         self._stuck_sign = 0
 
-        logger.info("AutoNavigator initialised (line-follow=%s, drive_time_per_coord=%.4f, turn_90=%.2fs)",
+        logger.info("AutoNavigator initialised (line-follow=%s, odom=%s, drive_time_per_coord=%.4f, turn_90=%.2fs)",
                     'enabled' if line_follower and line_follower.is_ready else 'disabled',
+                    'enabled' if odometry else 'disabled',
                     self.DRIVE_TIME_PER_COORD, self.TURN_90_TIME)
 
     # ── Public API ──────────────────────────────────────────
@@ -686,6 +706,8 @@ class AutoNavigator:
                 # Reset line-follower EMA state for new segment
                 if self._line_follower and hasattr(self._line_follower, 'reset'):
                     self._line_follower.reset()
+                if self._odometry and i == 0:
+                    self._odometry.reset()
                 self._prev_correction = 0.0
                 self._stuck_counter = 0
                 self._stuck_sign = 0
@@ -702,13 +724,23 @@ class AutoNavigator:
                     loop_start = time.time()
 
                     # ── Camera → CTE → PID → Steer every tick ──
-                    correction = await self._get_line_correction()
+                    correction, vision_cte, vision_conf = await self._get_line_correction_full()
                     steer = max(-1.0, min(1.0, correction))
 
                     # Apply single-servo steering EVERY tick
-                    # forward_steer internally: lệch → 1 servo quay, 1 servo dừng
-                    #                           centered → both servo forward
                     self.motor.forward_steer(steer)
+
+                    # ── Odometry update ──
+                    if self._odometry:
+                        odom_entry = self._odometry.update(
+                            steering=steer,
+                            vision_cte=vision_cte,
+                            vision_confidence=vision_conf,
+                            is_driving=True,
+                        )
+                        # Emit odom log at report cadence
+                        if (time.time() - last_report) >= self.POSITION_REPORT_INTERVAL:
+                            await emit_cb('odom-log', odom_entry)
 
                     # Stuck detection
                     corr_sign = 1 if correction > 0 else -1
@@ -847,6 +879,10 @@ class AutoNavigator:
         self.motor.stop()
         await asyncio.sleep(0.15)
 
+        # Update odometry heading after turn
+        if self._odometry:
+            self._odometry.handle_turn(direction)
+
     async def _drift_correct(self, cur_dir, next_dir):
         """
         Micro-correction pulse before an upcoming turn to compensate
@@ -884,3 +920,22 @@ class AutoNavigator:
         except Exception as e:
             logger.debug(f"Line-follow error: {e}")
             return 0.0
+
+    async def _get_line_correction_full(self):
+        """
+        Get steering + vision CTE + confidence for odometry fusion.
+        Returns (steering, vision_cte, confidence).
+        """
+        if self._line_follower is None or not self._line_follower.is_ready:
+            return 0.0, None, 0.0
+        if self._get_camera_frame is None:
+            return 0.0, None, 0.0
+        try:
+            frame = await self._get_camera_frame()
+            if frame is None:
+                return 0.0, None, 0.0
+            result = self._line_follower.analyse_frame_full(frame)
+            return result['steering'], result['vision_cte'], result['confidence']
+        except Exception as e:
+            logger.debug(f"Line-follow-full error: {e}")
+            return 0.0, None, 0.0

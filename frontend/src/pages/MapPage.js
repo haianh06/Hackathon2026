@@ -8,7 +8,7 @@ import {
 } from '@heroicons/react/24/outline';
 
 const STREAM_URLS = {
-    canny: '/camera/processed/stream?mode=canny',
+    lane: '/camera/processed/stream?mode=lane',
     all: '/camera/processed/stream?mode=all',
 };
 const DEBUG_URL = '/camera/lane/debug';
@@ -32,8 +32,12 @@ function MapPage() {
     const [debug, setDebug] = useState(null);
     const [debugPolling, setDebugPolling] = useState(false);
     const [debugHistory, setDebugHistory] = useState([]);
-    const [debugStreamMode, setDebugStreamMode] = useState('canny');
+    const [debugStreamMode, setDebugStreamMode] = useState('lane');
     const debugIntervalRef = useRef(null);
+
+    // ── Odometry state ──
+    const [odomLogs, setOdomLogs] = useState([]);
+    const [odomAutoScroll, setOdomAutoScroll] = useState(true);
 
     // ── Load map data ──
     useEffect(() => {
@@ -50,7 +54,14 @@ function MapPage() {
             else if (data.type === 'cancelled') { setIsNavigating(false); addLog(`⏹ [${ts}] Đã dừng`); }
             else if (data.type === 'line-correct') { addLog(`🔧 [${ts}] Bám làn: ${data.correction < 0 ? '◀' : '▶'} ${data.correction > 0 ? '+' : ''}${data.correction} ${data.steerTime}s`); }
         });
-        return () => { socket.off('vehicle-position'); socket.off('vehicle-dispatch'); socket.off('vehicle-returned'); socket.off('navigation-log'); };
+        socket.on('odom-log', (data) => {
+            setOdomLogs(prev => {
+                const entry = `[${data.source}] (${data.x?.toFixed(3)}, ${data.y?.toFixed(3)}) θ=${data.theta?.toFixed(1)}° CTE=${data.cte?.toFixed(4)} dist=${data.dist?.toFixed(3)}m`;
+                const next = [...prev, entry];
+                return next.length > 500 ? next.slice(-400) : next;
+            });
+        });
+        return () => { socket.off('vehicle-position'); socket.off('vehicle-dispatch'); socket.off('vehicle-returned'); socket.off('navigation-log'); socket.off('odom-log'); };
     }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
     // ── Debug polling ──
@@ -70,7 +81,8 @@ function MapPage() {
     }, [debugPolling]);
 
     const addLog = useCallback((msg) => { setNavLogs(prev => { const n = [...prev, msg]; return n.length > 200 ? n.slice(-150) : n; }); }, []);
-    useEffect(() => { if (logEndRef.current) logEndRef.current.scrollIntoView({ behavior: 'smooth' }); }, [navLogs]);
+    const odomEndRef = useRef(null);
+    useEffect(() => { if (odomAutoScroll && odomEndRef.current) odomEndRef.current.scrollIntoView({ behavior: 'smooth' }); }, [odomLogs, odomAutoScroll]);
 
     const loadMapData = async () => {
         try {
@@ -224,17 +236,37 @@ function MapPage() {
                     )}
 
                     {/* Nav log */}
-                    <div className="bg-white rounded-2xl border border-gray-200 overflow-hidden flex flex-col" style={{ maxHeight: 360 }}>
+                    <div className="bg-white rounded-2xl border border-gray-200 overflow-hidden flex flex-col" style={{ maxHeight: 280 }}>
                         <div className="flex items-center justify-between px-4 py-2.5 border-b bg-gray-50">
                             <span className="text-sm font-medium text-gray-600">Log di chuyển</span>
                             <button onClick={() => setNavLogs([])} className="text-xs text-gray-400 hover:text-red-500">Xoá</button>
                         </div>
-                        <div className="flex-1 overflow-y-auto p-3 font-mono text-xs leading-relaxed bg-gray-900 text-green-400">
+                        <div className="flex-1 overflow-y-auto p-3 font-mono text-xs leading-relaxed bg-gray-900 text-green-400" style={{ overflowAnchor: 'none' }}>
                             {navLogs.length === 0 && <div className="text-gray-600 text-center py-6">Chờ dữ liệu...</div>}
                             {navLogs.map((log, i) => (
                                 <div key={i} className={`py-0.5 ${log.startsWith('🏁') ? 'text-yellow-300 font-bold' : log.startsWith('⏹') ? 'text-red-400' : ''}`}>{log}</div>
                             ))}
-                            <div ref={logEndRef} />
+                        </div>
+                    </div>
+
+                    {/* Odometry log */}
+                    <div className="bg-white rounded-2xl border border-gray-200 overflow-hidden flex flex-col" style={{ maxHeight: 320 }}>
+                        <div className="flex items-center justify-between px-4 py-2.5 border-b bg-gray-50">
+                            <span className="text-sm font-medium text-gray-600">Odometry Log</span>
+                            <div className="flex items-center gap-3">
+                                <label className="flex items-center gap-1 text-xs text-gray-400 cursor-pointer">
+                                    <input type="checkbox" checked={odomAutoScroll} onChange={e => setOdomAutoScroll(e.target.checked)} className="w-3 h-3" />
+                                    Auto-scroll
+                                </label>
+                                <button onClick={() => setOdomLogs([])} className="text-xs text-gray-400 hover:text-red-500">Xoá</button>
+                            </div>
+                        </div>
+                        <div className="flex-1 overflow-y-auto p-3 font-mono text-xs leading-relaxed bg-gray-950 text-gray-300" style={{ overflowAnchor: 'none' }}>
+                            {odomLogs.length === 0 && <div className="text-gray-600 text-center py-6">Chờ odometry...</div>}
+                            {odomLogs.map((log, i) => (
+                                <div key={i} className={`py-0.5 ${log.startsWith('[VISION]') ? 'text-green-400' : log.startsWith('[ODOM]') ? 'text-amber-400' : ''}`}>{log}</div>
+                            ))}
+                            <div ref={odomEndRef} />
                         </div>
                     </div>
                 </div>
@@ -247,10 +279,10 @@ function MapPage() {
                             <div className="flex items-center justify-between px-4 py-2.5 border-b bg-gray-50">
                                 <div className="flex items-center gap-2">
                                     <span className="text-sm font-semibold text-gray-600">
-                                        {debugStreamMode === 'canny' ? 'Canny Edge' : 'Canny + Sign'}
+                                        {debugStreamMode === 'lane' ? 'Lane Detection' : 'Lane + Sign'}
                                     </span>
                                     <div className="flex rounded-lg overflow-hidden border border-gray-300">
-                                        {[['canny', 'Canny'], ['all', 'All']].map(([mode, label]) => (
+                                        {[['lane', 'Lane'], ['all', 'All']].map(([mode, label]) => (
                                             <button key={mode} onClick={() => setDebugStreamMode(mode)}
                                                 className={`px-2 py-1 text-xs font-medium ${debugStreamMode === mode ? 'bg-blue-600 text-white' : 'bg-white text-gray-600 hover:bg-gray-100'}`}>
                                                 {label}

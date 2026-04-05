@@ -33,6 +33,7 @@ except FileNotFoundError:
 from motor_control import create_motor_controller, AutoNavigator, LEFT_MIRROR, LEFT_NEUTRAL, RIGHT_NEUTRAL
 from camera_mjpeg import CameraManager
 from line_follower import LineFollower
+from odometry import OdometryTracker
 
 # RFID reader (custom spidev + lgpio driver for RST pin)
 try:
@@ -43,15 +44,7 @@ except ImportError as e:
     RFID_AVAILABLE = False
     logger.warning(f"RFID reader not available: {e}")
 
-# Import canny edge detection
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'canny-edge-detection-main'))
-try:
-    from test_1_improved import AdaptiveTrackerV2
-    CANNY_AVAILABLE = True
-    logger.info("AdaptiveTrackerV2 loaded successfully")
-except ImportError as e:
-    CANNY_AVAILABLE = False
-    logger.warning(f"AdaptiveTrackerV2 not available: {e}")
+# Line follower: Sliding Window BEV lane detection (see line_follower.py)
 
 # Socket.IO client
 try:
@@ -75,6 +68,7 @@ class HardwareDaemon:
         self.motor = create_motor_controller(CONFIG)
         self.camera = CameraManager(CONFIG)
         self.line_follower = LineFollower()
+        self.odometry = OdometryTracker()
 
         # Wire AutoNavigator with camera + line-follower
         async def _cam_getter():
@@ -84,6 +78,7 @@ class HardwareDaemon:
             self.motor,
             camera_getter=_cam_getter,
             line_follower=self.line_follower,
+            odometry=self.odometry,
         )
         self.running = False
         self.sio = None
@@ -95,7 +90,7 @@ class HardwareDaemon:
         self._map_y = 0  # grid coordinate y
         self._map_direction = 0  # 0=up(+y), 1=right(+x), 2=down(-y), 3=left(-x)
         self._map_step_count = 0
-        self._lane_tracker = AdaptiveTrackerV2() if CANNY_AVAILABLE else None
+        # Lane analysis now handled by self.line_follower (Sliding Window BEV)
 
         # ── RFID scanner state ──
         self._rfid_scanning = False
@@ -263,7 +258,7 @@ class HardwareDaemon:
 
         @self.sio.on('vehicle-returned')
         async def on_vehicle_returned(data=None):
-            logger.info("🔄 Vehicle returned — resetting heading and canny ROI")
+            logger.info("Vehicle returned — resetting heading and line follower")
             self.navigator.heading = None
             self.navigator._prev_correction = 0.0
             if self.navigator._line_follower:
@@ -287,7 +282,7 @@ class HardwareDaemon:
         # ====== Map Builder Mode ======
         @self.sio.on('map-build-step')
         async def on_map_build_step(data=None):
-            """Move one step forward using canny edge centering."""
+            """Move one step forward using lane follower."""
             logger.info("🗺 Map-build: step forward")
             asyncio.ensure_future(self._map_build_step_forward(data or {}))
 
@@ -307,7 +302,7 @@ class HardwareDaemon:
 
         @self.sio.on('map-build-analyse')
         async def on_map_build_analyse(data=None):
-            """Analyse current frame with canny and return results."""
+            """Analyse current frame and return results."""
             asyncio.ensure_future(self._map_build_analyse())
 
         # ====== Motor Calibration Commands ======
@@ -393,7 +388,6 @@ class HardwareDaemon:
             'platform': 'Raspberry Pi 5',
             'gpio_available': True,
             'line_follower': self.line_follower.is_ready,
-            'canny_available': CANNY_AVAILABLE,
             'rfid_available': RFID_AVAILABLE and self._rfid_reader is not None,
         }
         if self.sio and self.sio.connected:
@@ -412,12 +406,12 @@ class HardwareDaemon:
         """
         Move one step forward with CONTINUOUS servo adjustment.
 
-        AdaptiveTrackerV2 has a built-in PD controller + EMA filter
-        that outputs steer in [-1, +1]. We trust that output directly
+        Uses the Sliding Window BEV line follower which outputs
+        steer in [-1, +1]. We trust that output directly
         and only add drift-bias compensation for mechanical offset.
 
           1. Start driving forward
-          2. Every ~80ms: grab frame → target X + canny → get steer → adjust motor
+          2. Every ~80ms: grab frame -> line follower -> get steer -> adjust motor
           3. Stop after step_duration
         """
         import time as _time
@@ -426,13 +420,17 @@ class HardwareDaemon:
         # Configurable parameters
         step_duration = data.get('duration', 0.8)
         speed = data.get('speed', 40)
-        LOOP_INTERVAL = 0.05          # 50ms → ~20 Hz servo update (every servo cycle)
+        LOOP_INTERVAL = 0.03          # 30ms → ~33 Hz servo update
 
         try:
 
             # Reset line follower state for new segment
             if self.line_follower and hasattr(self.line_follower, 'reset'):
                 self.line_follower.reset()
+
+            # Reset odometry for new step session
+            if self._map_step_count == 0:
+                self.odometry.reset()
 
             # Start with forward_steer(0) — continuous steering from tick 0
             # Never call motor.forward() in the loop — always forward_steer()
@@ -444,24 +442,38 @@ class HardwareDaemon:
             while (_time.time() - start_time) < step_duration:
                 loop_start = _time.time()
 
-                # ── Grab frame → 2-tier steering (target X → canny) ──
+                # ── Grab frame -> lane follower full analysis ──
                 lane_steer = 0.0
+                vision_cte = None
+                vision_conf = 0.0
 
                 frame_bytes = await self.camera.get_latest_frame()
                 if frame_bytes and self.line_follower and self.line_follower.is_ready:
                     try:
-                        lane_steer = self.line_follower.analyse_frame(frame_bytes)
+                        result = self.line_follower.analyse_frame_full(frame_bytes)
+                        lane_steer = result['steering']
+                        vision_cte = result['vision_cte']
+                        vision_conf = result['confidence']
                         frames_ok += 1
                     except Exception as e:
                         logger.debug(f"Step loop detect error: {e}")
 
                 # ── Apply single-servo steering EVERY tick ──
-                # Vision PID already outputs the correct correction.
-                # Do NOT add drift bias — it creates a positive feedback
-                # loop that fights the PID and flips the steering sign.
                 final_steer = max(-1.0, min(1.0, lane_steer))
                 self.motor.forward_steer(final_steer)
                 last_steer = lane_steer
+
+                # ── Update odometry with sensor fusion ──
+                odom_entry = self.odometry.update(
+                    steering=final_steer,
+                    vision_cte=vision_cte,
+                    vision_confidence=vision_conf,
+                    is_driving=True,
+                )
+
+                # ── Emit odom-log to frontend ──
+                if self.sio and self.sio.connected:
+                    await self.sio.emit('odom-log', odom_entry)
 
                 # Sleep remainder of loop interval
                 elapsed = _time.time() - loop_start
@@ -483,6 +495,7 @@ class HardwareDaemon:
 
             # Report position
             if self.sio and self.sio.connected:
+                odom_pose = self.odometry.pose
                 await self.sio.emit('map-build-position', {
                     'x': self._map_x,
                     'y': self._map_y,
@@ -491,6 +504,9 @@ class HardwareDaemon:
                     'stepCount': self._map_step_count,
                     'steering': final_steer,
                     'framesOk': frames_ok,
+                    'odom': odom_pose,
+                    'odomDist': self.odometry.total_distance,
+                    'odomCte': self.odometry.fused_cte,
                     'timestamp': _time.time(),
                 })
 
@@ -509,9 +525,11 @@ class HardwareDaemon:
             if direction == 'left':
                 self.motor.turn_left(speed)
                 self._map_direction = (self._map_direction - 1) % 4
+                self.odometry.handle_turn('left')
             else:
                 self.motor.turn_right(speed)
                 self._map_direction = (self._map_direction + 1) % 4
+                self.odometry.handle_turn('right')
 
             await asyncio.sleep(turn_duration)
             self.motor.stop()
@@ -531,9 +549,9 @@ class HardwareDaemon:
             logger.error(f"Map-build turn error: {e}")
             self.motor.stop()
 
-    async def _do_canny_analysis(self):
-        """Run AdaptiveTrackerV2 on current frame."""
-        if not CANNY_AVAILABLE or self._lane_tracker is None:
+    async def _do_lane_analysis(self):
+        """Run Sliding Window BEV lane follower on current frame."""
+        if not self.line_follower or not self.line_follower.is_ready:
             return None
 
         frame_bytes = await self.camera.get_latest_frame()
@@ -541,28 +559,12 @@ class HardwareDaemon:
             return None
 
         try:
-            import cv2
-            nparr = np.frombuffer(frame_bytes, np.uint8)
-            frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-            if frame is None:
-                return None
-
-            h, w = frame.shape[:2]
-            frame = cv2.resize(frame, (640, 480))
-            steer, viz_frame = self._lane_tracker.process_frame(frame)
-
+            debug = self.line_follower.analyse_frame_debug(frame_bytes)
             return {
-                'steering': float(steer),
-                'laneQuality': 1.0 if abs(steer) > 0.001 else 0.0,
-                'centersCount': 0,
-                'leftsCount': 0,
-                'rightsCount': 0,
-                'midpoint': None,
-                'frameWidth': w,
-                'frameHeight': h,
-                'framesLost': 0,
-                'virtualLeft': False,
-                'virtualRight': False,
+                'steering': float(debug.get('correction', 0)),
+                'laneQuality': float(debug.get('confidence', 0)),
+                'status': debug.get('status', 'N/A'),
+                'intersection': debug.get('intersection', False),
             }
         except Exception as e:
             logger.error(f"Lane analysis error: {e}")
@@ -817,7 +819,7 @@ class HardwareDaemon:
     async def _map_build_analyse(self):
         """Analyse and send result to frontend."""
         import time as _time
-        analysis = await self._do_canny_analysis()
+        analysis = await self._do_lane_analysis()
         if self.sio and self.sio.connected:
             await self.sio.emit('map-build-analysis', {
                 'analysis': analysis,
@@ -926,11 +928,9 @@ class HardwareDaemon:
         r_lane_json = cors.add(app.router.add_resource('/lane/debug'))
         cors.add(r_lane_json.add_route('GET', handle_lane_debug_json))
 
-        # ── Canny edge detection lane overlay stream ──
-        async def handle_canny_stream(request):
-            """MJPEG stream with canny lane-detection overlay for Map Builder."""
-            import cv2 as _cv2
-
+        # ── Lane detection overlay stream (BEV sliding window) ──
+        async def handle_lane_overlay_stream(request):
+            """MJPEG stream with lane-detection overlay (sliding window BEV)."""
             response = web.StreamResponse(
                 status=200,
                 headers={
@@ -941,59 +941,16 @@ class HardwareDaemon:
             await response.prepare(request)
             boundary = b'--frame'
 
-            if not CANNY_AVAILABLE or not self._lane_tracker:
-                logger.warning("Lane stream requested but CANNY_AVAILABLE=%s, tracker=%s",
-                               CANNY_AVAILABLE, self._lane_tracker is not None)
-
             try:
                 while True:
                     frame_bytes = await self.camera.get_latest_frame()
-                    if frame_bytes:
-                        if CANNY_AVAILABLE and self._lane_tracker:
-                            try:
-                                nparr = np.frombuffer(frame_bytes, np.uint8)
-                                frame_bgr = _cv2.imdecode(nparr, _cv2.IMREAD_COLOR)
-                                if frame_bgr is not None:
-                                    frame_bgr = _cv2.resize(frame_bgr, (self._lane_tracker.w, self._lane_tracker.h))
-                                    steer, vis = self._lane_tracker.process_frame(frame_bgr)
-
-                                    # Add position text on viz
-                                    pos_text = f"Pos: ({self._map_x},{self._map_y}) Dir: {self._direction_name()}"
-                                    _cv2.putText(vis, pos_text, (15, 480 - 30), _cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-                                    _, jpeg = _cv2.imencode('.jpg', vis, [_cv2.IMWRITE_JPEG_QUALITY, 90])
-                                    frame_bytes = jpeg.tobytes()
-                            except Exception as e:
-                                logger.warning(f"Lane overlay error: {e}", exc_info=True)
-                                # Draw error text on raw frame so the user sees what's wrong
-                                try:
-                                    nparr = np.frombuffer(frame_bytes, np.uint8)
-                                    err_frame = _cv2.imdecode(nparr, _cv2.IMREAD_COLOR)
-                                    if err_frame is not None:
-                                        h, w = err_frame.shape[:2]
-                                        _cv2.putText(err_frame, "CANNY ERROR", (15, 35),
-                                                     _cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
-                                        _cv2.putText(err_frame, str(e)[:60], (15, 65),
-                                                     _cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
-                                        _, jpeg = _cv2.imencode('.jpg', err_frame, [_cv2.IMWRITE_JPEG_QUALITY, 90])
-                                        frame_bytes = jpeg.tobytes()
-                                except Exception:
-                                    pass
-                        else:
-                            # Canny not available — show status overlay on raw frame
-                            try:
-                                nparr = np.frombuffer(frame_bytes, np.uint8)
-                                raw_frame = _cv2.imdecode(nparr, _cv2.IMREAD_COLOR)
-                                if raw_frame is not None:
-                                    h, w = raw_frame.shape[:2]
-                                    _cv2.putText(raw_frame, "CANNY NOT AVAILABLE", (15, 35),
-                                                 _cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-                                    reason = "Module not loaded" if not CANNY_AVAILABLE else "Detector not initialized"
-                                    _cv2.putText(raw_frame, reason, (15, 60),
-                                                 _cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
-                                    _, jpeg = _cv2.imencode('.jpg', raw_frame, [_cv2.IMWRITE_JPEG_QUALITY, 90])
-                                    frame_bytes = jpeg.tobytes()
-                            except Exception:
-                                pass
+                    if frame_bytes and self.line_follower and self.line_follower.is_ready:
+                        try:
+                            debug = self.line_follower.analyse_frame_debug(frame_bytes)
+                            jpeg = debug.get('mask_jpeg') or frame_bytes
+                            frame_bytes = jpeg
+                        except Exception as e:
+                            logger.warning(f"Lane overlay error: {e}", exc_info=True)
 
                     if frame_bytes:
                         await response.write(
@@ -1007,52 +964,41 @@ class HardwareDaemon:
                 pass
             return response
 
-        async def handle_canny_snapshot(request):
-            """Single snapshot with canny overlay."""
+        async def handle_lane_overlay_snapshot(request):
+            """Single snapshot with lane-detection overlay."""
             frame_bytes = await self.camera.get_latest_frame()
             if not frame_bytes:
                 return web.Response(status=503, text='No frame')
-            if CANNY_AVAILABLE and self._lane_tracker:
+            if self.line_follower and self.line_follower.is_ready:
                 try:
-                    import cv2
-                    nparr = np.frombuffer(frame_bytes, np.uint8)
-                    frame_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                    if frame_bgr is not None:
-                        frame_bgr = cv2.resize(frame_bgr, (self._lane_tracker.w, self._lane_tracker.h))
-                        _, vis = self._lane_tracker.process_frame(frame_bgr)
-                        _, jpeg = cv2.imencode('.jpg', vis, [cv2.IMWRITE_JPEG_QUALITY, 85])
-                        frame_bytes = jpeg.tobytes()
+                    debug = self.line_follower.analyse_frame_debug(frame_bytes)
+                    jpeg = debug.get('mask_jpeg')
+                    if jpeg:
+                        frame_bytes = jpeg
                 except Exception as e:
                     logger.debug(f"Lane snapshot error: {e}")
             return web.Response(body=frame_bytes, content_type='image/jpeg')
 
-        r_canny_stream = cors.add(app.router.add_resource('/canny/stream'))
-        cors.add(r_canny_stream.add_route('GET', handle_canny_stream))
-        r_canny_snap = cors.add(app.router.add_resource('/canny/snapshot'))
-        cors.add(r_canny_snap.add_route('GET', handle_canny_snapshot))
+        r_lane_overlay = cors.add(app.router.add_resource('/lane/overlay/stream'))
+        cors.add(r_lane_overlay.add_route('GET', handle_lane_overlay_stream))
+        r_lane_snap = cors.add(app.router.add_resource('/lane/overlay/snapshot'))
+        cors.add(r_lane_snap.add_route('GET', handle_lane_overlay_snapshot))
 
         # ── Unified processed stream (mode via query param) ──
         async def handle_processed_stream(request):
-            """MJPEG stream with switchable processing: raw|canny|all."""
+            """MJPEG stream with switchable processing: raw|lane|all."""
             mode = request.query.get('mode', 'raw')
 
             # Only import cv2 when a processing mode actually needs it
             _cv2 = None
-            if mode in ('canny', 'all'):
+            if mode in ('sign', 'all'):
                 try:
                     import cv2 as _cv2
                 except ImportError:
                     logger.warning("cv2 not available for mode=%s", mode)
 
-            # Only import cv2 for sign mode too
-            if mode == 'sign' and _cv2 is None:
-                try:
-                    import cv2 as _cv2
-                except ImportError:
-                    logger.warning("cv2 not available for mode=sign")
-
             sleep_map = {
-                'raw': 0.03, 'canny': 0.07,
+                'raw': 0.03, 'lane': 0.07,
                 'all': 0.10, 'sign': 0.05,
             }
             sleep_time = sleep_map.get(mode, 0.1)
@@ -1077,17 +1023,15 @@ class HardwareDaemon:
                     jpeg = frame_bytes
 
                     try:
-                        if mode == 'canny':
-                            if CANNY_AVAILABLE and self._lane_tracker and _cv2:
-                                nparr = np.frombuffer(frame_bytes, np.uint8)
-                                bgr = _cv2.imdecode(nparr, _cv2.IMREAD_COLOR)
-                                if bgr is not None:
-                                    bgr = _cv2.resize(bgr, (640, 480))
-                                    _, vis = self._lane_tracker.process_frame(bgr)
-                                    _, enc = _cv2.imencode(
-                                        '.jpg', vis,
-                                        [_cv2.IMWRITE_JPEG_QUALITY, 90])
-                                    jpeg = enc.tobytes()
+                        if mode == 'lane':
+                            if self.line_follower and self.line_follower.is_ready:
+                                try:
+                                    debug = self.line_follower.analyse_frame_debug(frame_bytes)
+                                    debug_jpeg = debug.get('mask_jpeg')
+                                    if debug_jpeg:
+                                        jpeg = debug_jpeg
+                                except Exception:
+                                    pass
 
                         elif mode == 'sign' and _cv2:
                             nparr = np.frombuffer(frame_bytes, np.uint8)
@@ -1141,30 +1085,15 @@ class HardwareDaemon:
                                 jpeg = enc.tobytes()
 
                         elif mode == 'all' and _cv2:
-                            nparr = np.frombuffer(frame_bytes, np.uint8)
-                            bgr = _cv2.imdecode(nparr, _cv2.IMREAD_COLOR)
-                            if bgr is not None:
-                                bgr = _cv2.resize(bgr, (640, 480))
-
-                                # Canny lane overlay → base visualization
-                                if CANNY_AVAILABLE and self._lane_tracker:
-                                    _, vis = self._lane_tracker.process_frame(
-                                        bgr)
-                                else:
-                                    vis = bgr.copy()
-
-                                # Mode label
-                                h = vis.shape[0]
-                                _cv2.putText(
-                                    vis, "[ALL] Canny Lane Detection",
-                                    (15, h - 15),
-                                    _cv2.FONT_HERSHEY_SIMPLEX,
-                                    0.5, (255, 255, 0), 1)
-
-                                _, enc = _cv2.imencode(
-                                    '.jpg', vis,
-                                    [_cv2.IMWRITE_JPEG_QUALITY, 90])
-                                jpeg = enc.tobytes()
+                            # Lane overlay via line follower debug
+                            if self.line_follower and self.line_follower.is_ready:
+                                try:
+                                    debug = self.line_follower.analyse_frame_debug(frame_bytes)
+                                    debug_jpeg = debug.get('mask_jpeg')
+                                    if debug_jpeg:
+                                        jpeg = debug_jpeg
+                                except Exception:
+                                    pass
 
                     except Exception as e:
                         logger.warning(
